@@ -39,6 +39,16 @@ class RGBD : public BasePipeline {
                                                                      bool rsCompat,
                                                                      const std::string& nnType) override;
 };
+class RGBDAlternate : public BasePipeline {
+   public:
+    std::vector<std::unique_ptr<dai_nodes::BaseNode>> createPipeline(std::shared_ptr<rclcpp::Node> node,
+                                                                     std::shared_ptr<dai::Device> device,
+                                                                     std::shared_ptr<dai::Pipeline> pipeline,
+                                                                     std::shared_ptr<param_handlers::PipelineGenParamHandler> ph,
+                                                                     const std::string& deviceName,
+                                                                     bool rsCompat,
+                                                                     const std::string& nnType) override;
+};
 class RGBStereo : public BasePipeline {
    public:
     std::vector<std::unique_ptr<dai_nodes::BaseNode>> createPipeline(std::shared_ptr<rclcpp::Node> node,

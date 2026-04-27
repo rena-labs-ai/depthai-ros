@@ -70,6 +70,7 @@ add_library(
   src/dai_nodes/sensors/stereo.cpp
   src/dai_nodes/sensors/thermal.cpp
   src/dai_nodes/sensors/rgbd.cpp
+  src/dai_nodes/sensors/ir_alternator.cpp
   src/dai_nodes/sensors/vio.cpp
   # src/dai_nodes/sensors/slam.cpp
   src/dai_nodes/sensors/tof.cpp
@@ -109,7 +110,8 @@ target_link_libraries(
 add_library(
   ${PROJECT_NAME} SHARED
   src/driver.cpp src/pipeline/pipeline_generator.cpp
-  src/pipeline/base_pipeline.cpp src/pipeline/base_types.cpp)
+  src/pipeline/base_pipeline.cpp src/pipeline/base_types.cpp
+  src/pipeline/rgbd_alternate.cpp)
 
 target_link_libraries(
   ${PROJECT_NAME}

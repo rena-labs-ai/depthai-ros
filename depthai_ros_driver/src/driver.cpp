@@ -1,5 +1,7 @@
 #include "depthai_ros_driver_v3/driver.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <fstream>
 
 #include "depthai/device/Device.hpp"
@@ -10,6 +12,15 @@
 #include "rmw/qos_profiles.h"
 
 namespace depthai_ros_driver {
+
+namespace {
+bool isAlternateMode(const std::shared_ptr<rclcpp::Node>& node) {
+    if(!node->has_parameter("pipeline_gen.i_pipeline_type")) return false;
+    auto t = node->get_parameter("pipeline_gen.i_pipeline_type").as_string();
+    std::transform(t.begin(), t.end(), t.begin(), [](unsigned char c) { return std::toupper(c); });
+    return t == "RGBD_ALTERNATE";
+}
+}  // namespace
 
 Driver::Driver(const rclcpp::NodeOptions& options) : rclcpp::Node("driver", options) {
     //  Since we cannot use shared_from this before the object is initialized, we need to use a timer to start the device.
@@ -286,6 +297,10 @@ void Driver::startDevice() {
 }
 
 void Driver::setIR() {
+    if(isAlternateMode(shared_from_this())) {
+        RCLCPP_INFO(get_logger(), "rgbd_alternate mode active; IR is owned by the on-device Script.");
+        return;
+    }
     bool hasIR = true;
     if(platform == dai::Platform::RVC2) {
         hasIR = !device->getIrDrivers().empty();
@@ -299,12 +314,13 @@ void Driver::setIR() {
 }
 
 rcl_interfaces::msg::SetParametersResult Driver::parameterCB(const std::vector<rclcpp::Parameter>& params) {
+    bool altMode = isAlternateMode(shared_from_this());
     for(const auto& p : params) {
         bool hasIR = true;
         if(platform == dai::Platform::RVC2) {
             hasIR = !device->getIrDrivers().empty();
         }
-        if(ph->getParam<bool>("i_enable_ir") && hasIR) {
+        if(!altMode && ph->getParam<bool>("i_enable_ir") && hasIR) {
             if(p.get_name() == ph->getFullParamName("r_laser_dot_intensity")) {
                 float laserdotIntensity = p.get_value<float>();
                 device->setIrLaserDotProjectorIntensity(laserdotIntensity);

@@ -36,6 +36,15 @@ void DriverParamHandler::declareParams() {
     declareAndLogParam<bool>("i_restart_on_diagnostics_error", false);
     declareAndLogParam<bool>("i_rs_compat", false);
 
+    // Alternate-mode (rgbd_alternate pipeline) per-branch IR config. Inert otherwise.
+    declareAndLogParam<int>("i_alternate_phase_offset", 0, getRangedIntDescriptor(0, 1));
+    declareAndLogParam<std::string>("this.namespace", "primary");
+    declareAndLogParam<float>("this.r_laser_dot_intensity", 1.0, getRangedFloatDescriptor(0.0, 1.0));
+    declareAndLogParam<float>("this.r_floodlight_intensity", 0.0, getRangedFloatDescriptor(0.0, 1.0));
+    declareAndLogParam<std::string>("other.namespace", "secondary");
+    declareAndLogParam<float>("other.r_laser_dot_intensity", 0.0, getRangedFloatDescriptor(0.0, 1.0));
+    declareAndLogParam<float>("other.r_floodlight_intensity", 0.0, getRangedFloatDescriptor(0.0, 1.0));
+
     declareAndLogParam<bool>("i_publish_tf_from_calibration", true);
     declareAndLogParam<std::string>("i_tf_device_name", getROSNode()->get_name());
     declareAndLogParam<std::string>("i_tf_device_model", "");

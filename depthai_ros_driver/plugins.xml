@@ -5,6 +5,9 @@
     <class type="depthai_ros_driver::pipeline_gen::RGBD" base_class_type="depthai_ros_driver::pipeline_gen::BasePipeline">
         <description>RGBD Pipeline.</description>
     </class>
+    <class type="depthai_ros_driver::pipeline_gen::RGBDAlternate" base_class_type="depthai_ros_driver::pipeline_gen::BasePipeline">
+        <description>RGBD pipeline with per-frame IR alternation (laser dot vs flood). Demuxes into two branches.</description>
+    </class>
     <class type="depthai_ros_driver::pipeline_gen::RGBStereo" base_class_type="depthai_ros_driver::pipeline_gen::BasePipeline">
         <description>RGBStereo Pipeline.</description>
     </class>

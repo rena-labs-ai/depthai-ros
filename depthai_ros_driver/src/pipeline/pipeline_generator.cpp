@@ -19,6 +19,7 @@ PipelineGenerator::PipelineGenerator()
     : pipelineLoader(std::make_shared<pluginlib::ClassLoader<BasePipeline>>("depthai_ros_driver_v3", "depthai_ros_driver::pipeline_gen::BasePipeline")) {
     pluginTypeMap = {{"RGB", "depthai_ros_driver::pipeline_gen::RGB"},
                      {"RGBD", "depthai_ros_driver::pipeline_gen::RGBD"},
+                     {"RGBD_ALTERNATE", "depthai_ros_driver::pipeline_gen::RGBDAlternate"},
                      {"RGBSTEREO", "depthai_ros_driver::pipeline_gen::RGBStereo"},
                      {"STEREO", "depthai_ros_driver::pipeline_gen::Stereo"},
                      {"DEPTH", "depthai_ros_driver::pipeline_gen::Depth"},
@@ -30,6 +31,7 @@ PipelineGenerator::PipelineGenerator()
                      {"THERMAL", "depthai_ros_driver::pipeline_gen::Thermal"}};
     pipelineTypeMap = {{"RGB", PipelineType::RGB},
                        {"RGBD", PipelineType::RGBD},
+                       {"RGBD_ALTERNATE", PipelineType::RGBDAlternate},
                        {"RGBSTEREO", PipelineType::RGBStereo},
                        {"STEREO", PipelineType::Stereo},
                        {"DEPTH", PipelineType::Depth},
