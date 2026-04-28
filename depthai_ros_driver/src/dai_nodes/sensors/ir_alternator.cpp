@@ -22,6 +22,16 @@ IrAlternator::IrAlternator(const std::string& daiNodeName,
     script = pipeline->create<dai::node::Script>();
     script->setProcessor(dai::ProcessorType::LEON_CSS);
 
+    // Always process the most recent tick. Stale ticks would tag frames that
+    // already shipped.
+    script->inputs["tick"].setBlocking(false);
+    script->inputs["tick"].setMaxSize(1);
+
+    // phaseOffset: which branch the FIRST captured frame's IR state should be.
+    // 0 -> "this", 1 -> "other". Used only for cross-device IR phase alignment;
+    // host routing is purely tag-driven and does not need parity at all.
+    bool firstIsThis = (phaseOffset % 2) == 0;
+
     std::ostringstream body;
     body.precision(6);
     body << std::fixed;
@@ -29,25 +39,42 @@ IrAlternator::IrAlternator(const std::string& daiNodeName,
          << "thisFlood = " << thisBranch.flood << "\n"
          << "otherDot = " << otherBranch.laserDot << "\n"
          << "otherFlood = " << otherBranch.flood << "\n"
-         << "phaseOffset = " << phaseOffset << "\n"
+         << "firstIsThis = " << (firstIsThis ? "True" : "False") << "\n"
          << "node.warn(f'IrAlternator started; IR drivers: {str(Device.getIrDrivers())}')\n"
-         << "if ((0 + phaseOffset) % 2) == 0:\n"
+         // Prime the IR for the first captured frame.
+         << "if firstIsThis:\n"
          << "    Device.setIrLaserDotProjectorIntensity(thisDot)\n"
          << "    Device.setIrFloodLightIntensity(thisFlood)\n"
          << "else:\n"
          << "    Device.setIrLaserDotProjectorIntensity(otherDot)\n"
          << "    Device.setIrFloodLightIntensity(otherFlood)\n"
+         << "currentIsThis = firstIsThis\n"
          << "while True:\n"
          << "    tick = node.io['tick'].get()\n"
-         << "    seq = tick.getSequenceNum()\n"
-         << "    isThis = ((seq + phaseOffset) % 2) == 0\n"
-         // Set IR for the NEXT frame (its parity will be opposite).
-         << "    if isThis:\n"
-         << "        Device.setIrLaserDotProjectorIntensity(otherDot)\n"
-         << "        Device.setIrFloodLightIntensity(otherFlood)\n"
-         << "    else:\n"
+         // Emit tag for this frame: 1 byte IR state + 8 bytes device-clock
+         // timestamp (little-endian MICROSECONDS). Microseconds because
+         // Python timedelta only has us precision, so we'd lose nanos anyway;
+         // host matches by the same us key.
+         << "    ts_dev = tick.getTimestampDevice()\n"
+         << "    ts_us = int(ts_dev.total_seconds() * 1e6)\n"
+         << "    state_byte = 1 if currentIsThis else 0\n"
+         << "    data = bytearray(9)\n"
+         << "    data[0] = state_byte\n"
+         << "    for i in range(8):\n"
+         << "        data[1 + i] = (ts_us >> (i*8)) & 0xFF\n"
+         << "    tag = Buffer(9)\n"
+         << "    tag.setData(bytes(data))\n"
+         << "    node.io['tag'].send(tag)\n"
+         << "    if (tick.getSequenceNum() % 60) == 0:\n"
+         << "        node.warn(f'IrAlt seq={tick.getSequenceNum()} ts_us={ts_us} currentIsThis={currentIsThis}')\n"
+         // Toggle for the NEXT pulse.
+         << "    currentIsThis = not currentIsThis\n"
+         << "    if currentIsThis:\n"
          << "        Device.setIrLaserDotProjectorIntensity(thisDot)\n"
-         << "        Device.setIrFloodLightIntensity(thisFlood)\n";
+         << "        Device.setIrFloodLightIntensity(thisFlood)\n"
+         << "    else:\n"
+         << "        Device.setIrLaserDotProjectorIntensity(otherDot)\n"
+         << "        Device.setIrFloodLightIntensity(otherFlood)\n";
 
     script->setScript(body.str(), getName());
 }
@@ -61,6 +88,10 @@ void IrAlternator::closeQueues() {}
 
 dai::Node::Input& IrAlternator::getTickInput() {
     return script->inputs["tick"];
+}
+
+dai::Node::Output* IrAlternator::getTagOutput() {
+    return &script->outputs["tag"];
 }
 
 }  // namespace dai_nodes

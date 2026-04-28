@@ -22,12 +22,11 @@ namespace depthai_ros_driver {
 namespace dai_nodes {
 
 /**
- * Device-side Script (LEON_CSS) that toggles IR each FSYNC pulse.
- *
- * Frame data does NOT flow through the Script (Script outputs are typed Buffer
- * and downstream nodes like StereoDepth choke on them). The Script only takes
- * a tick from one camera output to wake on each frame; demuxing happens on the
- * host using the frame's own seqNum.
+ * Device-side Script (LEON_CSS) that toggles IR each FSYNC pulse and emits a
+ * sidecar tag per frame containing the IR state in effect during that frame's
+ * exposure. The host pairs tags with data frames by device timestamp (set by
+ * the sensor ISP at FSYNC edge — identical across sensors of the same OAK
+ * for the same pulse).
  */
 class IrAlternator : public BaseNode {
    public:
@@ -52,6 +51,7 @@ class IrAlternator : public BaseNode {
     void closeQueues() override;
 
     dai::Node::Input& getTickInput();
+    dai::Node::Output* getTagOutput();
 
    private:
     std::shared_ptr<dai::node::Script> script;

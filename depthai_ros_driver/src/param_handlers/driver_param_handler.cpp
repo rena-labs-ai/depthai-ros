@@ -38,6 +38,12 @@ void DriverParamHandler::declareParams() {
 
     // Alternate-mode (rgbd_alternate pipeline) per-branch IR config. Inert otherwise.
     declareAndLogParam<int>("i_alternate_phase_offset", 0, getRangedIntDescriptor(0, 1));
+    // Tolerance (µs) for matching a frame's device timestamp to a Script-emitted
+    // tag. Each FSYNC pulse is ~33333µs (30Hz) apart, and we observe ~20µs
+    // per-sensor stamping offset, so 200µs is a safe default.
+    declareAndLogParam<int>("i_left_right_tolerance_us", 200, getRangedIntDescriptor(0, 30000));
+    // How long (ms) a frame waits for a matching tag before being dropped.
+    declareAndLogParam<int>("i_frame_tag_timeout_ms", 10, getRangedIntDescriptor(0, 1000));
     declareAndLogParam<std::string>("this.namespace", "primary");
     declareAndLogParam<float>("this.r_laser_dot_intensity", 1.0, getRangedFloatDescriptor(0.0, 1.0));
     declareAndLogParam<float>("this.r_floodlight_intensity", 0.0, getRangedFloatDescriptor(0.0, 1.0));

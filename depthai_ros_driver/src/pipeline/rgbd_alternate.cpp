@@ -1,7 +1,15 @@
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
 #include <deque>
+#include <functional>
+#include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "camera_info_manager/camera_info_manager.hpp"
@@ -67,20 +75,24 @@ class AlternateRouter : public dai_nodes::BaseNode {
                     dai::Node::Output* rightMonoOut,
                     dai::Node::Output* rgbAlignOut,
                     dai::Node::Output* rgbColorOut,
+                    dai::Node::Output* tagOut,
                     dai::CameraBoardSocket leftSocket,
                     dai::CameraBoardSocket rightSocket,
                     dai::CameraBoardSocket alignSocket,
                     const std::string& thisNs,
                     const std::string& otherNs,
-                    int phaseOffset)
+                    int toleranceUs,
+                    int timeoutMs)
         : BaseNode("alternate", node, pipeline, device->getDeviceName(), rsCompat),
           thisNs_(thisNs),
           otherNs_(otherNs),
-          phaseOffset_(phaseOffset),
+          toleranceUs_(toleranceUs),
+          timeoutMs_(timeoutMs),
           stereoPh_(stereoPh),
           rgbdPh_(rgbdPh),
           leftMonoOut_(leftMonoOut),
           rightMonoOut_(rightMonoOut),
+          tagOut_(tagOut),
           leftSocket_(leftSocket),
           rightSocket_(rightSocket),
           alignSocket_(alignSocket) {
@@ -139,6 +151,15 @@ class AlternateRouter : public dai_nodes::BaseNode {
 
         // PCL
         setupPclPair(device, calHandler, &rgbdNode_->pcl, pclSize);
+
+        // Tag stream from the IrAlternator Script: each entry is 1 byte IR
+        // state + 8 bytes device-clock timestamp ns (little-endian). We
+        // populate a timestamp -> isThis map; data callbacks look up by their
+        // own device timestamp.
+        tagQ_ = tagOut_->createOutputQueue(128, false);
+        tagCbId_ = tagQ_->addCallback([this](const std::shared_ptr<dai::ADatatype>& data) {
+            this->onTag(data);
+        });
     }
 
     void closeQueues() override {
@@ -151,6 +172,10 @@ class AlternateRouter : public dai_nodes::BaseNode {
         if(pclPair_.q) {
             pclPair_.q->removeCallback(pclPair_.cbId);
             pclPair_.q->close();
+        }
+        if(tagQ_) {
+            tagQ_->removeCallback(tagCbId_);
+            tagQ_->close();
         }
     }
 
@@ -240,11 +265,98 @@ class AlternateRouter : public dai_nodes::BaseNode {
         });
     }
 
-    void onImage(const std::shared_ptr<dai::ADatatype>& data, ImagePair& pair) {
-        if(!rclcpp::ok()) return;
-        auto img = std::dynamic_pointer_cast<dai::ImgFrame>(data);
-        if(!img) return;
-        bool isThis = (((static_cast<int64_t>(img->getSequenceNum()) + phaseOffset_) % 2) == 0);
+    // Find the closest tag's value within ±toleranceUs_ of ts_us.
+    // Caller must hold mu_.
+    bool lookupNearestLocked(int64_t ts_us, bool& outIsThis) {
+        if(tagMap_.empty()) return false;
+        auto upper = tagMap_.lower_bound(ts_us);
+        int64_t bestDiff = std::numeric_limits<int64_t>::max();
+        bool best = false;
+        bool any = false;
+        if(upper != tagMap_.end()) {
+            int64_t diff = std::llabs(upper->first - ts_us);
+            if(diff < bestDiff) { bestDiff = diff; best = upper->second; any = true; }
+        }
+        if(upper != tagMap_.begin()) {
+            auto prev = std::prev(upper);
+            int64_t diff = std::llabs(prev->first - ts_us);
+            if(diff < bestDiff) { bestDiff = diff; best = prev->second; any = true; }
+        }
+        if(!any || bestDiff > toleranceUs_) return false;
+        outIsThis = best;
+        return true;
+    }
+
+    void onTag(const std::shared_ptr<dai::ADatatype>& data) {
+        auto buf = std::dynamic_pointer_cast<dai::Buffer>(data);
+        if(!buf) return;
+        const auto& raw = buf->getData();
+        if(raw.size() < 9) return;
+        bool isThis = (raw[0] != 0);
+        int64_t ts_us = 0;
+        for(int i = 0; i < 8; ++i) {
+            ts_us |= static_cast<int64_t>(raw[1 + i]) << (i * 8);
+        }
+        std::vector<std::pair<std::function<void(bool)>, bool>> toRun;
+        std::vector<std::pair<std::string, int64_t>> expired;
+        size_t mapSize;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            tagMap_[ts_us] = isThis;
+            tagOrder_.push_back(ts_us);
+            while(tagOrder_.size() > 256) {
+                tagMap_.erase(tagOrder_.front());
+                tagOrder_.pop_front();
+            }
+            mapSize = tagOrder_.size();
+
+            auto now = std::chrono::steady_clock::now();
+            std::vector<Pending> still;
+            still.reserve(pending_.size());
+            for(auto& p : pending_) {
+                bool match;
+                if(lookupNearestLocked(p.ts_us, match)) {
+                    toRun.emplace_back(std::move(p.dispatch), match);
+                } else if(now <= p.deadline) {
+                    still.push_back(std::move(p));
+                } else {
+                    expired.emplace_back(p.tag, p.ts_us);
+                }
+            }
+            pending_ = std::move(still);
+        }
+        for(auto& [fn, match] : toRun) fn(match);
+        for(auto& [tag, ts] : expired) {
+            RCLCPP_INFO_THROTTLE(getROSNode()->get_logger(), *getROSNode()->get_clock(), 2000,
+                                 "[%s] expired ts_us=%ld (no tag within %dms)", tag.c_str(), ts, timeoutMs_);
+        }
+        RCLCPP_INFO_THROTTLE(getROSNode()->get_logger(), *getROSNode()->get_clock(), 2000,
+                             "[tag] ts_us=%ld isThis=%d (mapSize=%zu)", ts_us, (int)isThis, mapSize);
+    }
+
+    bool lookupIrState(int64_t ts_us, bool& outIsThis) {
+        std::lock_guard<std::mutex> lk(mu_);
+        return lookupNearestLocked(ts_us, outIsThis);
+    }
+
+    void enqueuePending(int64_t ts_us, const std::string& tag, std::function<void(bool)> dispatch) {
+        std::lock_guard<std::mutex> lk(mu_);
+        Pending p;
+        p.ts_us = ts_us;
+        p.tag = tag;
+        p.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs_);
+        p.dispatch = std::move(dispatch);
+        pending_.push_back(std::move(p));
+    }
+
+    static int64_t tsDeviceUs(const std::shared_ptr<dai::ImgFrame>& img) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(img->getTimestampDevice().time_since_epoch()).count();
+    }
+    static int64_t tsDeviceUs(const std::shared_ptr<dai::PointCloudData>& pcl) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(pcl->getTimestampDevice().time_since_epoch()).count();
+    }
+
+    void publishImage(ImagePair& pair, const std::shared_ptr<dai::ImgFrame>& img, bool isThis) {
         auto& pub = isThis ? pair.thisPub : pair.otherPub;
         if(pub.getNumSubscribers() == 0) return;
         auto rawMsg = pair.conv->toRosMsgRawPtr(img);
@@ -253,11 +365,7 @@ class AlternateRouter : public dai_nodes::BaseNode {
         pub.publish(rawMsg, info);
     }
 
-    void onPcl(const std::shared_ptr<dai::ADatatype>& data) {
-        if(!rclcpp::ok()) return;
-        auto pcl = std::dynamic_pointer_cast<dai::PointCloudData>(data);
-        if(!pcl) return;
-        bool isThis = (((static_cast<int64_t>(pcl->getSequenceNum()) + phaseOffset_) % 2) == 0);
+    void publishPcl(const std::shared_ptr<dai::PointCloudData>& pcl, bool isThis) {
         auto& pub = isThis ? pclPair_.thisPub : pclPair_.otherPub;
         if(pub->get_subscription_count() == 0 && pub->get_intra_process_subscription_count() == 0) return;
         std::deque<sensor_msgs::msg::PointCloud2> deq;
@@ -268,15 +376,56 @@ class AlternateRouter : public dai_nodes::BaseNode {
         }
     }
 
+    void onImage(const std::shared_ptr<dai::ADatatype>& data, ImagePair& pair) {
+        if(!rclcpp::ok()) return;
+        auto img = std::dynamic_pointer_cast<dai::ImgFrame>(data);
+        if(!img) return;
+        int64_t ts_us = tsDeviceUs(img);
+        RCLCPP_INFO_THROTTLE(getROSNode()->get_logger(), *getROSNode()->get_clock(), 2000,
+                             "[%s] arrived ts_us=%ld", pair.baseName.c_str(), ts_us);
+        bool isThis;
+        if(lookupIrState(ts_us, isThis)) {
+            RCLCPP_INFO_THROTTLE(getROSNode()->get_logger(), *getROSNode()->get_clock(), 2000,
+                                 "[%s] ts_us=%ld -> %s", pair.baseName.c_str(), ts_us,
+                                 isThis ? thisNs_.c_str() : otherNs_.c_str());
+            publishImage(pair, img, isThis);
+            return;
+        }
+        // No tag yet — queue for up to 10ms while we wait for it.
+        enqueuePending(ts_us, pair.baseName,
+                       [this, &pair, img](bool match) { publishImage(pair, img, match); });
+    }
+
+    void onPcl(const std::shared_ptr<dai::ADatatype>& data) {
+        if(!rclcpp::ok()) return;
+        auto pcl = std::dynamic_pointer_cast<dai::PointCloudData>(data);
+        if(!pcl) return;
+        int64_t ts_us = tsDeviceUs(pcl);
+        RCLCPP_INFO_THROTTLE(getROSNode()->get_logger(), *getROSNode()->get_clock(), 2000,
+                             "[pcl] arrived ts_us=%ld", ts_us);
+        bool isThis;
+        if(lookupIrState(ts_us, isThis)) {
+            RCLCPP_INFO_THROTTLE(getROSNode()->get_logger(), *getROSNode()->get_clock(), 2000,
+                                 "[pcl] ts_us=%ld -> %s", ts_us,
+                                 isThis ? thisNs_.c_str() : otherNs_.c_str());
+            publishPcl(pcl, isThis);
+            return;
+        }
+        enqueuePending(ts_us, "pcl",
+                       [this, pcl](bool match) { publishPcl(pcl, match); });
+    }
+
     std::string thisNs_;
     std::string otherNs_;
-    int phaseOffset_;
+    int toleranceUs_;
+    int timeoutMs_;
     std::shared_ptr<param_handlers::StereoParamHandler> stereoPh_;
     std::shared_ptr<param_handlers::RGBDParamHandler> rgbdPh_;
     std::shared_ptr<dai::node::StereoDepth> stereoNode_;
     std::shared_ptr<dai::node::RGBD> rgbdNode_;
     dai::Node::Output* leftMonoOut_;
     dai::Node::Output* rightMonoOut_;
+    dai::Node::Output* tagOut_;
     dai::CameraBoardSocket leftSocket_;
     dai::CameraBoardSocket rightSocket_;
     dai::CameraBoardSocket alignSocket_;
@@ -284,6 +433,18 @@ class AlternateRouter : public dai_nodes::BaseNode {
     ImagePair rightPair_;
     ImagePair depthPair_;
     PclPair pclPair_;
+    struct Pending {
+        int64_t ts_us;
+        std::string tag;
+        std::chrono::steady_clock::time_point deadline;
+        std::function<void(bool)> dispatch;
+    };
+    std::mutex mu_;
+    std::map<int64_t, bool> tagMap_;
+    std::deque<int64_t> tagOrder_;
+    std::vector<Pending> pending_;
+    std::shared_ptr<dai::MessageQueue> tagQ_;
+    int tagCbId_ = -1;
 };
 
 }  // namespace
@@ -313,6 +474,8 @@ std::vector<std::unique_ptr<dai_nodes::BaseNode>> RGBDAlternate::createPipeline(
     auto otherLaser = static_cast<float>(node->get_parameter("driver.other.r_laser_dot_intensity").as_double());
     auto otherFlood = static_cast<float>(node->get_parameter("driver.other.r_floodlight_intensity").as_double());
     auto phaseOffset = static_cast<int>(node->get_parameter("driver.i_alternate_phase_offset").as_int());
+    auto toleranceUs = static_cast<int>(node->get_parameter("driver.i_left_right_tolerance_us").as_int());
+    auto timeoutMs = static_cast<int>(node->get_parameter("driver.i_frame_tag_timeout_ms").as_int());
 
     // L/R raw publishers are owned by AlternateRouter (per-branch namespaced).
     // Force off any user-set i_publish_topic on the L/R sensor wrappers.
@@ -362,8 +525,10 @@ std::vector<std::unique_ptr<dai_nodes::BaseNode>> RGBDAlternate::createPipeline(
     auto router = std::make_unique<AlternateRouter>(
         node, pipeline, device, rsCompat, stereoPh, rgbdPh,
         leftOut, rightOut, rgbAlignOut, rgbColorOut,
+        ira->getTagOutput(),
         leftSocket, rightSocket, alignSocket,
-        thisNs, otherNs, phaseOffset);
+        thisNs, otherNs,
+        toleranceUs, timeoutMs);
 
     daiNodes.push_back(std::move(rgb));
     daiNodes.push_back(std::move(left));
