@@ -37,7 +37,6 @@ void DriverParamHandler::declareParams() {
     declareAndLogParam<bool>("i_rs_compat", false);
 
     // Alternate-mode (rgbd_alternate pipeline) per-branch IR config. Inert otherwise.
-    declareAndLogParam<int>("i_alternate_phase_offset", 0, getRangedIntDescriptor(0, 1));
     // Tolerance (µs) for matching a frame's device timestamp to a Script-emitted
     // tag. Each FSYNC pulse is ~33333µs (30Hz) apart, and we observe ~20µs
     // per-sensor stamping offset, so 200µs is a safe default.
@@ -47,9 +46,14 @@ void DriverParamHandler::declareParams() {
     declareAndLogParam<std::string>("this.namespace", "primary");
     declareAndLogParam<float>("this.r_laser_dot_intensity", 1.0, getRangedFloatDescriptor(0.0, 1.0));
     declareAndLogParam<float>("this.r_floodlight_intensity", 0.0, getRangedFloatDescriptor(0.0, 1.0));
+    // Number of consecutive frames captured in this branch before switching to
+    // the other. Default 1 → strict alternation. Use e.g. this=5, other=25 to
+    // get 5 dot_on frames per 30-frame cycle (1:5 duty).
+    declareAndLogParam<int>("this.i_frames_per_cycle", 1, getRangedIntDescriptor(1, 1000));
     declareAndLogParam<std::string>("other.namespace", "secondary");
     declareAndLogParam<float>("other.r_laser_dot_intensity", 0.0, getRangedFloatDescriptor(0.0, 1.0));
     declareAndLogParam<float>("other.r_floodlight_intensity", 0.0, getRangedFloatDescriptor(0.0, 1.0));
+    declareAndLogParam<int>("other.i_frames_per_cycle", 1, getRangedIntDescriptor(1, 1000));
 
     declareAndLogParam<bool>("i_publish_tf_from_calibration", true);
     declareAndLogParam<std::string>("i_tf_device_name", getROSNode()->get_name());

@@ -33,6 +33,7 @@ class IrAlternator : public BaseNode {
     struct BranchIntensities {
         float laserDot = 0.0f;
         float flood = 0.0f;
+        int framesPerCycle = 1;
     };
 
     IrAlternator(const std::string& daiNodeName,
@@ -41,8 +42,7 @@ class IrAlternator : public BaseNode {
                  const std::string& deviceName,
                  bool rsCompat,
                  const BranchIntensities& thisBranch,
-                 const BranchIntensities& otherBranch,
-                 int phaseOffset);
+                 const BranchIntensities& otherBranch);
     ~IrAlternator();
 
     void setNames() override;

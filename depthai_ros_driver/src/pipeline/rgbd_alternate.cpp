@@ -298,8 +298,6 @@ class AlternateRouter : public dai_nodes::BaseNode {
             ts_us |= static_cast<int64_t>(raw[1 + i]) << (i * 8);
         }
         std::vector<std::pair<std::function<void(bool)>, bool>> toRun;
-        std::vector<std::pair<std::string, int64_t>> expired;
-        size_t mapSize;
         {
             std::lock_guard<std::mutex> lk(mu_);
             tagMap_[ts_us] = isThis;
@@ -308,7 +306,6 @@ class AlternateRouter : public dai_nodes::BaseNode {
                 tagMap_.erase(tagOrder_.front());
                 tagOrder_.pop_front();
             }
-            mapSize = tagOrder_.size();
 
             auto now = std::chrono::steady_clock::now();
             std::vector<Pending> still;
@@ -319,19 +316,12 @@ class AlternateRouter : public dai_nodes::BaseNode {
                     toRun.emplace_back(std::move(p.dispatch), match);
                 } else if(now <= p.deadline) {
                     still.push_back(std::move(p));
-                } else {
-                    expired.emplace_back(p.tag, p.ts_us);
                 }
+                // else: expired, drop silently
             }
             pending_ = std::move(still);
         }
         for(auto& [fn, match] : toRun) fn(match);
-        for(auto& [tag, ts] : expired) {
-            RCLCPP_INFO_THROTTLE(getROSNode()->get_logger(), *getROSNode()->get_clock(), 2000,
-                                 "[%s] expired ts_us=%ld (no tag within %dms)", tag.c_str(), ts, timeoutMs_);
-        }
-        RCLCPP_INFO_THROTTLE(getROSNode()->get_logger(), *getROSNode()->get_clock(), 2000,
-                             "[tag] ts_us=%ld isThis=%d (mapSize=%zu)", ts_us, (int)isThis, mapSize);
     }
 
     bool lookupIrState(int64_t ts_us, bool& outIsThis) {
@@ -381,17 +371,11 @@ class AlternateRouter : public dai_nodes::BaseNode {
         auto img = std::dynamic_pointer_cast<dai::ImgFrame>(data);
         if(!img) return;
         int64_t ts_us = tsDeviceUs(img);
-        RCLCPP_INFO_THROTTLE(getROSNode()->get_logger(), *getROSNode()->get_clock(), 2000,
-                             "[%s] arrived ts_us=%ld", pair.baseName.c_str(), ts_us);
         bool isThis;
         if(lookupIrState(ts_us, isThis)) {
-            RCLCPP_INFO_THROTTLE(getROSNode()->get_logger(), *getROSNode()->get_clock(), 2000,
-                                 "[%s] ts_us=%ld -> %s", pair.baseName.c_str(), ts_us,
-                                 isThis ? thisNs_.c_str() : otherNs_.c_str());
             publishImage(pair, img, isThis);
             return;
         }
-        // No tag yet — queue for up to 10ms while we wait for it.
         enqueuePending(ts_us, pair.baseName,
                        [this, &pair, img](bool match) { publishImage(pair, img, match); });
     }
@@ -401,13 +385,8 @@ class AlternateRouter : public dai_nodes::BaseNode {
         auto pcl = std::dynamic_pointer_cast<dai::PointCloudData>(data);
         if(!pcl) return;
         int64_t ts_us = tsDeviceUs(pcl);
-        RCLCPP_INFO_THROTTLE(getROSNode()->get_logger(), *getROSNode()->get_clock(), 2000,
-                             "[pcl] arrived ts_us=%ld", ts_us);
         bool isThis;
         if(lookupIrState(ts_us, isThis)) {
-            RCLCPP_INFO_THROTTLE(getROSNode()->get_logger(), *getROSNode()->get_clock(), 2000,
-                                 "[pcl] ts_us=%ld -> %s", ts_us,
-                                 isThis ? thisNs_.c_str() : otherNs_.c_str());
             publishPcl(pcl, isThis);
             return;
         }
@@ -473,12 +452,15 @@ std::vector<std::unique_ptr<dai_nodes::BaseNode>> RGBDAlternate::createPipeline(
     auto thisFlood = static_cast<float>(node->get_parameter("driver.this.r_floodlight_intensity").as_double());
     auto otherLaser = static_cast<float>(node->get_parameter("driver.other.r_laser_dot_intensity").as_double());
     auto otherFlood = static_cast<float>(node->get_parameter("driver.other.r_floodlight_intensity").as_double());
-    auto phaseOffset = static_cast<int>(node->get_parameter("driver.i_alternate_phase_offset").as_int());
+    auto thisFrames = static_cast<int>(node->get_parameter("driver.this.i_frames_per_cycle").as_int());
+    auto otherFrames = static_cast<int>(node->get_parameter("driver.other.i_frames_per_cycle").as_int());
     auto toleranceUs = static_cast<int>(node->get_parameter("driver.i_left_right_tolerance_us").as_int());
     auto timeoutMs = static_cast<int>(node->get_parameter("driver.i_frame_tag_timeout_ms").as_int());
 
     // L/R raw publishers are owned by AlternateRouter (per-branch namespaced).
-    // Force off any user-set i_publish_topic on the L/R sensor wrappers.
+    // RGB stays on its own SensorWrapper auto-publisher at full FPS — its
+    // timestamp lags mono by ~33 ms (longer ISP), so splitting it by IR phase
+    // would not align cleanly with left/right anyway.
     forceBoolParamFalse(node, getNodeName(node, NodeNameEnum::Left) + ".i_publish_topic");
     forceBoolParamFalse(node, getNodeName(node, NodeNameEnum::Right) + ".i_publish_topic");
 
@@ -507,9 +489,8 @@ std::vector<std::unique_ptr<dai_nodes::BaseNode>> RGBDAlternate::createPipeline(
         pipeline,
         deviceName,
         rsCompat,
-        dai_nodes::IrAlternator::BranchIntensities{thisLaser, thisFlood},
-        dai_nodes::IrAlternator::BranchIntensities{otherLaser, otherFlood},
-        phaseOffset);
+        dai_nodes::IrAlternator::BranchIntensities{thisLaser, thisFlood, thisFrames},
+        dai_nodes::IrAlternator::BranchIntensities{otherLaser, otherFlood, otherFrames});
     leftOut->link(ira->getTickInput());
 
     auto stereoPh = std::make_shared<param_handlers::StereoParamHandler>(node, "stereo", deviceName, rsCompat);

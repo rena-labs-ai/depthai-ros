@@ -16,8 +16,7 @@ IrAlternator::IrAlternator(const std::string& daiNodeName,
                            const std::string& deviceName,
                            bool rsCompat,
                            const BranchIntensities& thisBranch,
-                           const BranchIntensities& otherBranch,
-                           int phaseOffset)
+                           const BranchIntensities& otherBranch)
     : BaseNode(daiNodeName, node, pipeline, deviceName, rsCompat) {
     script = pipeline->create<dai::node::Script>();
     script->setProcessor(dai::ProcessorType::LEON_CSS);
@@ -27,11 +26,10 @@ IrAlternator::IrAlternator(const std::string& daiNodeName,
     script->inputs["tick"].setBlocking(false);
     script->inputs["tick"].setMaxSize(1);
 
-    // phaseOffset: which branch the FIRST captured frame's IR state should be.
-    // 0 -> "this", 1 -> "other". Used only for cross-device IR phase alignment;
-    // host routing is purely tag-driven and does not need parity at all.
-    bool firstIsThis = (phaseOffset % 2) == 0;
-
+    // First captured frame is "this" by convention. Host routing is purely
+    // tag-driven, so the actual phase doesn't matter — every frame is labeled
+    // by the IR state that was active during its exposure, independent of
+    // which pulse the Script started on.
     std::ostringstream body;
     body.precision(6);
     body << std::fixed;
@@ -39,16 +37,13 @@ IrAlternator::IrAlternator(const std::string& daiNodeName,
          << "thisFlood = " << thisBranch.flood << "\n"
          << "otherDot = " << otherBranch.laserDot << "\n"
          << "otherFlood = " << otherBranch.flood << "\n"
-         << "firstIsThis = " << (firstIsThis ? "True" : "False") << "\n"
-         << "node.warn(f'IrAlternator started; IR drivers: {str(Device.getIrDrivers())}')\n"
-         // Prime the IR for the first captured frame.
-         << "if firstIsThis:\n"
-         << "    Device.setIrLaserDotProjectorIntensity(thisDot)\n"
-         << "    Device.setIrFloodLightIntensity(thisFlood)\n"
-         << "else:\n"
-         << "    Device.setIrLaserDotProjectorIntensity(otherDot)\n"
-         << "    Device.setIrFloodLightIntensity(otherFlood)\n"
-         << "currentIsThis = firstIsThis\n"
+         << "thisBudget = " << thisBranch.framesPerCycle << "\n"
+         << "otherBudget = " << otherBranch.framesPerCycle << "\n"
+         << "node.warn(f'IrAlternator started; thisBudget={thisBudget} otherBudget={otherBudget} drivers={str(Device.getIrDrivers())}')\n"
+         << "Device.setIrLaserDotProjectorIntensity(thisDot)\n"
+         << "Device.setIrFloodLightIntensity(thisFlood)\n"
+         << "currentIsThis = True\n"
+         << "remaining = thisBudget\n"
          << "while True:\n"
          << "    tick = node.io['tick'].get()\n"
          // Emit tag for this frame: 1 byte IR state + 8 bytes device-clock
@@ -65,16 +60,19 @@ IrAlternator::IrAlternator(const std::string& daiNodeName,
          << "    tag = Buffer(9)\n"
          << "    tag.setData(bytes(data))\n"
          << "    node.io['tag'].send(tag)\n"
-         << "    if (tick.getSequenceNum() % 60) == 0:\n"
-         << "        node.warn(f'IrAlt seq={tick.getSequenceNum()} ts_us={ts_us} currentIsThis={currentIsThis}')\n"
-         // Toggle for the NEXT pulse.
-         << "    currentIsThis = not currentIsThis\n"
-         << "    if currentIsThis:\n"
-         << "        Device.setIrLaserDotProjectorIntensity(thisDot)\n"
-         << "        Device.setIrFloodLightIntensity(thisFlood)\n"
-         << "    else:\n"
-         << "        Device.setIrLaserDotProjectorIntensity(otherDot)\n"
-         << "        Device.setIrFloodLightIntensity(otherFlood)\n";
+         // Maintain a per-branch frame budget. Stay in the current branch
+         // until 'remaining' hits zero, then flip and reload from the other
+         // branch's budget. budget=1,1 reproduces strict alternation.
+         << "    remaining = remaining - 1\n"
+         << "    if remaining <= 0:\n"
+         << "        currentIsThis = not currentIsThis\n"
+         << "        remaining = thisBudget if currentIsThis else otherBudget\n"
+         << "        if currentIsThis:\n"
+         << "            Device.setIrLaserDotProjectorIntensity(thisDot)\n"
+         << "            Device.setIrFloodLightIntensity(thisFlood)\n"
+         << "        else:\n"
+         << "            Device.setIrLaserDotProjectorIntensity(otherDot)\n"
+         << "            Device.setIrFloodLightIntensity(otherFlood)\n";
 
     script->setScript(body.str(), getName());
 }
