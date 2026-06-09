@@ -142,6 +142,15 @@ void StereoParamHandler::declareParams(std::shared_ptr<dai::node::StereoDepth> s
     stereo->initialConfig->setLeftRightCheckThreshold(declareAndLogParam<int>("i_lrc_threshold", 10));
     // // stereo->initialConfig->setMedianFilter(static_cast<dai::MedianFilter>(declareAndLogParam<int>("i_depth_filter_size", 5)));
     stereo->initialConfig->setConfidenceThreshold(declareAndLogParam<int>("i_stereo_conf_threshold", 15));
+    // Final-layer confidence-map mask (host-side), applied in stereo.cpp setInOut.
+    // i_confidence_mask_min is on the confidence-MAP scale (higher = more
+    // confident); depth is zeroed where conf < this value. Requires i_aligned:false
+    // so depth and the rectified confidence map share a frame.
+    declareAndLogParam<bool>("i_enable_confidence_mask", false);
+    declareAndLogParam<int>("i_confidence_mask_min", 100);
+    // Debug: publish the raw confidence map on ~/<name>/confidence (RAW8, rectified
+    // frame) so the mask can be verified per-pixel against depth.
+    declareAndLogParam<bool>("i_publish_confidence", false);
     if(declareAndLogParam<bool>("i_subpixel", true) && !lowBandwidth) {
         stereo->initialConfig->setSubpixel(true);
         stereo->initialConfig->setSubpixelFractionalBits(declareAndLogParam<int>("i_subpixel_fractional_bits", 3));

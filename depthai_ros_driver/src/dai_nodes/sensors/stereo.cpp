@@ -12,6 +12,7 @@
 #include "depthai/pipeline/node/StereoDepth.hpp"
 #include "depthai_ros_driver_v3/dai_nodes/nn/nn_helpers.hpp"
 #include "depthai_ros_driver_v3/dai_nodes/nn/spatial_nn_wrapper.hpp"
+#include "depthai_ros_driver_v3/dai_nodes/sensors/confidence_mask.hpp"
 #include "depthai_ros_driver_v3/dai_nodes/sensors/feature_tracker.hpp"
 #include "depthai_ros_driver_v3/dai_nodes/sensors/img_pub.hpp"
 #include "depthai_ros_driver_v3/dai_nodes/sensors/rgbd.hpp"
@@ -105,18 +106,41 @@ Stereo::Stereo(const std::string& daiNodeName,
             getName() + "_" + right->getName() + "_rgbd", node, pipeline, device, rsCompat, *right, getUnderlyingNode(), aligned);
     }
 
+    // Optional confidence mask (classic StereoDepth only). Zeroes depth where the
+    // confidence map is below threshold. It MUST run in the rectified frame
+    // (depth + confidenceMap share that frame), so it sits BEFORE any alignment;
+    // the masked depth is then aligned downstream exactly like raw depth.
+    bool maskEnabled = ph->getParam<bool>("i_enable_confidence_mask") && !ph->getParam<bool>("i_use_neural_depth");
+    if(maskEnabled) {
+        confMaskNode = pipeline->create<ConfidenceMask>();
+        confMaskNode->setThreshold(ph->getParam<int>("i_confidence_mask_min"));
+        stereoCamNode->depth.link(confMaskNode->inDepth);
+        stereoCamNode->confidenceMap.link(confMaskNode->inConf);
+    }
+    // Depth source feeding alignment / publishing: the masked depth if enabled.
+    dai::Node::Output* depthSrc;
+    if(confMaskNode) {
+        depthSrc = &confMaskNode->out;
+    } else if(ph->getParam<bool>("i_use_neural_depth")) {
+        depthSrc = &neuralDepthNode->depth;
+    } else {
+        depthSrc = &stereoCamNode->depth;
+    }
+
     // Check alignment, if board socket is one of the pairs, align.
     // if not it should be aligned externally by calling align method in pipeline creation
     auto socketID = ph->getSocketID();
     if(aligned) {
-        if(platform == dai::Platform::RVC4) {
+        // Use an explicit ImageAlign node on RVC4, OR whenever masking is on: that
+        // lets the mask run pre-alignment in the rectified frame and aligns the
+        // MASKED depth here, instead of letting StereoDepth align internally
+        // (which would leave the confidence map in a different frame). RVC2 has no
+        // on-device ImageAlign, so run it on host there.
+        bool explicitAlign = (platform == dai::Platform::RVC4) || maskEnabled;
+        if(explicitAlign) {
             alignNode = pipeline->create<dai::node::ImageAlign>();
-            alignNode->setRunOnHost(ph->getParam<bool>("i_run_align_on_host"));
-            if(ph->getParam<bool>("i_use_neural_depth")) {
-                neuralDepthNode->depth.link(alignNode->input);
-            } else {
-                stereoCamNode->depth.link(alignNode->input);
-            }
+            alignNode->setRunOnHost(platform == dai::Platform::RVC4 ? ph->getParam<bool>("i_run_align_on_host") : true);
+            depthSrc->link(alignNode->input);
             alignNode->input.setBlocking(false);
             alignNode->inputAlignTo.setBlocking(false);
         }
@@ -136,6 +160,7 @@ void Stereo::setNames() {
     stereoQName = getName() + "_stereo";
     leftRectQName = getName() + "_left_rect";
     rightRectQName = getName() + "_right_rect";
+    confidenceQName = getName() + "_confidence";
 }
 
 std::shared_ptr<dai::node::StereoDepth> Stereo::getUnderlyingNode() {
@@ -174,16 +199,31 @@ void Stereo::setInOut(std::shared_ptr<dai::Pipeline> pipeline) {
                 stereoPub = setupOutput(pipeline, stereoQName, &stereoCamNode->disparity, ph->getParam<bool>("i_synced"), encConf);
             }
         } else {
-            if(aligned && platform == dai::Platform::RVC4) {
-                stereoPub = setupOutput(pipeline, stereoQName, &alignNode->outputAligned, ph->getParam<bool>("i_synced"), encConf);
+            // Select the depth to publish (mask + align nodes are built in the
+            // constructor): aligned output if an align node exists (masked-then-
+            // aligned, or plain aligned on RVC4); else masked depth; else raw depth.
+            dai::Node::Output* depthOut;
+            if(aligned && alignNode) {
+                depthOut = &alignNode->outputAligned;
+            } else if(confMaskNode) {
+                depthOut = &confMaskNode->out;
+            } else if(ph->getParam<bool>("i_use_neural_depth")) {
+                depthOut = &neuralDepthNode->depth;
             } else {
-                if(ph->getParam<bool>("i_use_neural_depth")) {
-                    stereoPub = setupOutput(pipeline, stereoQName, &neuralDepthNode->depth, ph->getParam<bool>("i_synced"), encConf);
-                } else {
-                    stereoPub = setupOutput(pipeline, stereoQName, &stereoCamNode->depth, ph->getParam<bool>("i_synced"), encConf);
-                }
+                depthOut = &stereoCamNode->depth;
             }
+            stereoPub = setupOutput(pipeline, stereoQName, depthOut, ph->getParam<bool>("i_synced"), encConf);
         }
+    }
+
+    // Debug: publish the raw confidence map (RAW8, rectified frame) so the mask
+    // can be verified per-pixel against the depth. confidenceMap exists only on
+    // classic StereoDepth (not NeuralDepth) and is unaligned, so pixel-comparison
+    // to depth is valid only with i_aligned:false.
+    if(ph->getParam<bool>("i_publish_confidence") && !ph->getParam<bool>("i_use_neural_depth")) {
+        utils::VideoEncoderConfig encConf;
+        encConf.enabled = false;
+        confidencePub = setupOutput(pipeline, confidenceQName, &stereoCamNode->confidenceMap, ph->getParam<bool>("i_synced"), encConf);
     }
 
     if(ph->getParam<bool>("i_left_rect_publish_topic")) {
@@ -321,11 +361,42 @@ void Stereo::setupStereoQueue(std::shared_ptr<dai::Device> device) {
     }
 }
 
+void Stereo::setupConfidenceQueue(std::shared_ptr<dai::Device> device) {
+    using param_handlers::ParamNames;
+    utils::ImgConverterConfig convConfig;
+    convConfig.tfPrefix = getOpticalFrameName(ph->getParam<std::string>("i_socket_name"));
+    convConfig.getBaseDeviceTimestamp = ph->getParam<bool>(ParamNames::GET_BASE_DEVICE_TIMESTAMP);
+    convConfig.updateROSBaseTimeOnRosMsg = ph->getParam<bool>(ParamNames::UPDATE_ROS_BASE_TIME_ON_ROS_MSG);
+    convConfig.encoding = dai::ImgFrame::Type::RAW8;
+    convConfig.reverseSocketOrder = ph->getParam<bool>(ParamNames::REVERSE_STEREO_SOCKET_ORDER);
+    convConfig.isStereo = false;
+
+    utils::ImgPublisherConfig pubConf;
+    pubConf.daiNodeName = getName();
+    pubConf.topicName = "~/" + getName();
+    pubConf.topicSuffix = "/confidence";
+    pubConf.rectified = true;
+    pubConf.undistorted = true;
+    pubConf.width = ph->getParam<int>(ParamNames::WIDTH);
+    pubConf.height = ph->getParam<int>(ParamNames::HEIGHT);
+    pubConf.socket = ph->getSocketID();
+    pubConf.calibrationFile = ph->getParam<std::string>(ParamNames::CALIBRATION_FILE);
+    pubConf.leftSocket = leftSensInfo.socket;
+    pubConf.rightSocket = rightSensInfo.socket;
+    pubConf.lazyPub = ph->getParam<bool>(ParamNames::ENABLE_LAZY_PUBLISHER);
+    pubConf.maxQSize = ph->getParam<int>(ParamNames::MAX_Q_SIZE);
+
+    confidencePub->setup(device, convConfig, pubConf);
+}
+
 void Stereo::setupQueues(std::shared_ptr<dai::Device> device) {
     left->setupQueues(device);
     right->setupQueues(device);
     if(ph->getParam<bool>("i_publish_topic")) {
         setupStereoQueue(device);
+    }
+    if(ph->getParam<bool>("i_publish_confidence") && !ph->getParam<bool>("i_use_neural_depth")) {
+        setupConfidenceQueue(device);
     }
     if(ph->getParam<bool>("i_enable_left_rgbd")) {
         rgbdNodeLeft->setupQueues(device);
@@ -358,6 +429,9 @@ void Stereo::closeQueues() {
     if(ph->getParam<bool>("i_publish_topic")) {
         stereoPub->closeQueue();
     }
+    if(ph->getParam<bool>("i_publish_confidence") && !ph->getParam<bool>("i_use_neural_depth")) {
+        confidencePub->closeQueue();
+    }
     if(ph->getParam<bool>("i_enable_left_rgbd")) {
         rgbdNodeLeft->closeQueues();
     }
@@ -386,14 +460,14 @@ void Stereo::closeQueues() {
 
 void Stereo::link(dai::Node::Input& in, int linkType) {
     if(linkType == static_cast<int>(link_types::StereoLinkType::stereo)) {
-        if(aligned && platform == dai::Platform::RVC4) {
+        if(aligned && alignNode) {
             alignNode->outputAligned.link(in);
+        } else if(confMaskNode) {
+            confMaskNode->out.link(in);
+        } else if(ph->getParam<bool>("i_use_neural_depth")) {
+            neuralDepthNode->depth.link(in);
         } else {
-            if(ph->getParam<bool>("i_use_neural_depth")) {
-                neuralDepthNode->depth.link(in);
-            } else {
-                stereoCamNode->depth.link(in);
-            }
+            stereoCamNode->depth.link(in);
         }
     } else if(linkType == static_cast<int>(link_types::StereoLinkType::left)) {
         if(ph->getParam<bool>("i_use_neural_depth")) {
@@ -451,12 +525,12 @@ dai::Node::Input& Stereo::getInput(int linkType) {
             return stereoCamNode->right;
         }
     } else if(linkType == static_cast<int>(link_types::StereoLinkType::align)) {
-        if(platform == dai::Platform::RVC2) {
-            // neural depth doesn't work on rvc2
-            return stereoCamNode->inputAlignTo;
-        } else {
+        // If we built an explicit ImageAlign node (RVC4, or masking on RVC2), the
+        // align-to image feeds it; otherwise StereoDepth aligns depth internally.
+        if(alignNode) {
             return alignNode->inputAlignTo;
         }
+        return stereoCamNode->inputAlignTo;
     } else {
         throw std::runtime_error("Wrong link type specified!");
     }

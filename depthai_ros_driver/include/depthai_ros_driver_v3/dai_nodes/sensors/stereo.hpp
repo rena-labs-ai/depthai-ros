@@ -41,6 +41,7 @@ namespace sensor_helpers {
 class ImagePubliser;
 }
 class RGBD;
+class ConfidenceMask;
 class StereoNodeWrapper {
    public:
     StereoNodeWrapper() {}
@@ -78,14 +79,16 @@ class Stereo : public BaseNode {
 
    private:
     void setupStereoQueue(std::shared_ptr<dai::Device> device);
+    void setupConfidenceQueue(std::shared_ptr<dai::Device> device);
     void setupLeftRectQueue(std::shared_ptr<dai::Device> device);
     void setupRightRectQueue(std::shared_ptr<dai::Device> device);
     void setupRectQueue(std::shared_ptr<dai::Device> device, dai::CameraFeatures& sensorInfo, std::shared_ptr<sensor_helpers::ImagePublisher> pub, bool isLeft);
-    std::shared_ptr<sensor_helpers::ImagePublisher> stereoPub, leftRectPub, rightRectPub;
+    std::shared_ptr<sensor_helpers::ImagePublisher> stereoPub, leftRectPub, rightRectPub, confidencePub;
     StereoNodeWrapper stereoNodeWrapper;
     std::shared_ptr<dai::node::StereoDepth> stereoCamNode;
     std::shared_ptr<dai::node::NeuralDepth> neuralDepthNode;
     std::shared_ptr<dai::node::ImageAlign> alignNode;
+    std::shared_ptr<ConfidenceMask> confMaskNode;
     dai::Platform platform;
     std::unique_ptr<RGBD> rgbdNodeLeft, rgbdNodeRight;
     std::shared_ptr<SensorWrapper> left, right;
@@ -93,7 +96,7 @@ class Stereo : public BaseNode {
     std::unique_ptr<param_handlers::StereoParamHandler> ph;
     std::shared_ptr<dai::MessageQueue> leftRectQ, rightRectQ;
     std::shared_ptr<dai::InputQueue> neuralControl;
-    std::string stereoQName, leftRectQName, rightRectQName;
+    std::string stereoQName, leftRectQName, rightRectQName, confidenceQName;
     dai::CameraFeatures leftSensInfo, rightSensInfo;
     bool aligned;
     dai::Node::Output* leftOut;
