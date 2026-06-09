@@ -113,7 +113,10 @@ Stereo::Stereo(const std::string& daiNodeName,
     bool maskEnabled = ph->getParam<bool>("i_enable_confidence_mask") && !ph->getParam<bool>("i_use_neural_depth");
     if(maskEnabled) {
         confMaskNode = pipeline->create<ConfidenceMask>();
-        confMaskNode->setThreshold(ph->getParam<int>("i_confidence_mask_min"));
+        // Reuse the stereo confidence threshold (same scale as the confidence
+        // map, higher = stricter). The mask hard-guarantees it on the output,
+        // regardless of upstream post-filters re-adding sub-threshold pixels.
+        confMaskNode->setThreshold(ph->getParam<int>("i_stereo_conf_threshold"));
         stereoCamNode->depth.link(confMaskNode->inDepth);
         stereoCamNode->confidenceMap.link(confMaskNode->inConf);
     }
