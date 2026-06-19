@@ -60,7 +60,6 @@ StereoParamHandler::StereoParamHandler(std::shared_ptr<rclcpp::Node> node, const
     declareAndLogParam<bool>(ParamNames::REVERSE_STEREO_SOCKET_ORDER, false);
     declareAndLogParam<bool>(ParamNames::PUBLISH_COMPRESSED, false);
     declareAndLogParam<bool>("i_log_latency", false);
-    declareAndLogParam<bool>("i_publish_best_effort", false);
     declareAndLogParam<int>("i_depth_png_level", 3);
     declareAndLogParam<bool>("i_publish_compressed_depth", true);
     declareAndLogParam<float>(ParamNames::FPS, 30);

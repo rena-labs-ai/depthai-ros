@@ -358,7 +358,6 @@ void Stereo::setupStereoQueue(std::shared_ptr<dai::Device> device) {
     pubConf.maxQSize = ph->getParam<int>(ParamNames::MAX_Q_SIZE);
     pubConf.publishCompressed = ph->getParam<bool>(ParamNames::PUBLISH_COMPRESSED);
     pubConf.logLatency = ph->getParam<bool>("i_log_latency");
-    pubConf.bestEffort = ph->getParam<bool>("i_publish_best_effort");
     pubConf.pngLevel = ph->getParam<int>("i_depth_png_level");
     pubConf.enableCompressedDepth = ph->getParam<bool>("i_publish_compressed_depth");
 

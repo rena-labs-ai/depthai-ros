@@ -18,7 +18,6 @@
 #include "depthai_ros_driver_v3/utils.hpp"
 #include "ffmpeg_image_transport_msgs/msg/ffmpeg_packet.hpp"
 #include "image_transport/image_transport.hpp"
-#include "rmw/qos_profiles.h"
 #include "sensor_msgs/msg/compressed_image.hpp"
 
 namespace depthai_ros_driver {
@@ -65,12 +64,7 @@ void ImagePublisher::setup(std::shared_ptr<dai::Device> device, const utils::Img
     }
     rclcpp::PublisherOptions pubOptions;
     pubOptions.qos_overriding_options = rclcpp::QosOverridingOptions::with_default_policies();
-    // Image streams are sensor data: optionally publish BEST_EFFORT so a slow
-    // RELIABLE subscriber can't back-pressure (block) the driver's publish() call.
     rclcpp::QoS imgQos(10);
-    if(pubConfig.bestEffort) {
-        imgQos.best_effort();
-    }
     if(pubConfig.publishCompressed) {
         if(encConfig.profile == dai::VideoEncoderProperties::Profile::MJPEG) {
             compressedImgPub =
@@ -98,11 +92,7 @@ void ImagePublisher::setup(std::shared_ptr<dai::Device> device, const utils::Img
         infoPub =
             node->create_publisher<sensor_msgs::msg::CameraInfo>(pubConfig.topicName + pubConfig.infoSuffix + "/camera_info", rclcpp::QoS(10), pubOptions);
     } else {
-        auto itQos = rmw_qos_profile_default;
-        if(pubConfig.bestEffort) {
-            itQos.reliability = RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT;
-        }
-        imgPubIT = image_transport::create_camera_publisher(node.get(), pubConfig.topicName + pubConfig.topicSuffix, itQos);
+        imgPubIT = image_transport::create_camera_publisher(node.get(), pubConfig.topicName + pubConfig.topicSuffix);
     }
     if(!synced) {
         if(encConfig.enabled) {

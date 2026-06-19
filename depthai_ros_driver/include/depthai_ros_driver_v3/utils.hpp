@@ -75,7 +75,6 @@ struct ImgPublisherConfig {
     bool qBlocking = false;
     bool publishCompressed = false;
     bool logLatency = false;
-    bool bestEffort = false;
     int pngLevel = 3;
     bool enableCompressedDepth = true;
 };
