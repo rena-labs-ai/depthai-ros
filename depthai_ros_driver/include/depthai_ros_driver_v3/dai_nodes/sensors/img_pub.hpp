@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "depthai/pipeline/Node.hpp"
 #include "depthai/pipeline/datatype/ADatatype.hpp"
@@ -92,6 +93,15 @@ class ImagePublisher {
    private:
     bool detectSubscription(const rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr& pub,
                             const rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr& infoPub);
+    // Per-step latency logging (enabled via i_log_latency). Accumulates per frame
+    // and emits one min/avg/max line every 30 frames (~1s at 30fps).
+    void recordLatency(double devUsbMs, double convertMs, double encodeMs, double publishMs, double queueSize);
+    std::vector<double> latDevUsb;
+    std::vector<double> latConvert;
+    std::vector<double> latEncode;
+    std::vector<double> latPublish;
+    std::vector<double> latTotal;
+    std::vector<double> latQSize;
     std::shared_ptr<rclcpp::Node> node;
     utils::VideoEncoderConfig encConfig;
     utils::ImgPublisherConfig pubConfig;

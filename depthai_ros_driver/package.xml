@@ -27,6 +27,7 @@
   <depend>cv_bridge</depend>
   <depend>image_transport</depend>
   <depend>image_transport_plugins</depend>
+  <depend>compressed_depth_image_transport</depend>
   <depend>image_pipeline</depend>
   <depend>depthai_v3</depend>
   <depend>depthai_bridge_v3</depend>

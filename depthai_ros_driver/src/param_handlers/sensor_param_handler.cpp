@@ -37,6 +37,7 @@ void SensorParamHandler::declareCommonParams(dai::CameraBoardSocket socket) {
     declareAndLogParam<std::string>(ParamNames::CALIBRATION_FILE, "");
     declareAndLogParam<bool>(ParamNames::UPDATE_ROS_BASE_TIME_ON_ROS_MSG, false);
     declareAndLogParam<bool>(ParamNames::ENABLE_LAZY_PUBLISHER, true);
+    declareAndLogParam<bool>("i_publish_best_effort", false);
     declareAndLogParam<bool>(ParamNames::ADD_EXPOSURE_OFFSET, false);
     declareAndLogParam<int>(ParamNames::EXPOSURE_OFFSET, 0);
     declareAndLogParam<bool>(ParamNames::REVERSE_STEREO_SOCKET_ORDER, false);
