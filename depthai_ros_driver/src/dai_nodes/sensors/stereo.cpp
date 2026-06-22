@@ -359,7 +359,7 @@ void Stereo::setupStereoQueue(std::shared_ptr<dai::Device> device) {
     pubConf.publishCompressed = ph->getParam<bool>(ParamNames::PUBLISH_COMPRESSED);
     pubConf.logLatency = ph->getParam<bool>("i_log_latency");
     pubConf.pngLevel = ph->getParam<int>("i_depth_png_level");
-    pubConf.enableCompressedDepth = ph->getParam<bool>("i_publish_compressed_depth");
+    pubConf.enableCompressed = ph->getParam<bool>("i_enable_compressed");
 
     stereoPub->setup(device, convConfig, pubConf);
     if(ph->getParam<bool>("i_use_neural_depth")) {

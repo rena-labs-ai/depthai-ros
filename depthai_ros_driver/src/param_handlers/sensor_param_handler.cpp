@@ -42,6 +42,8 @@ void SensorParamHandler::declareCommonParams(dai::CameraBoardSocket socket) {
     declareAndLogParam<bool>(ParamNames::REVERSE_STEREO_SOCKET_ORDER, false);
     declareAndLogParam<bool>(ParamNames::SYNCED, false);
     declareAndLogParam<bool>(ParamNames::PUBLISH_COMPRESSED, false);
+    declareAndLogParam<bool>("i_enable_compressed", true);
+    declareAndLogParam<bool>("i_log_latency", false);
 }
 void SensorParamHandler::declareParams(std::shared_ptr<dai::node::Camera> cam, bool publish) {
     declareAndLogParam<bool>(ParamNames::PUBLISH_TOPIC, publish);

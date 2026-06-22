@@ -61,7 +61,7 @@ StereoParamHandler::StereoParamHandler(std::shared_ptr<rclcpp::Node> node, const
     declareAndLogParam<bool>(ParamNames::PUBLISH_COMPRESSED, false);
     declareAndLogParam<bool>("i_log_latency", false);
     declareAndLogParam<int>("i_depth_png_level", 3);
-    declareAndLogParam<bool>("i_publish_compressed_depth", true);
+    declareAndLogParam<bool>("i_enable_compressed", true);
     declareAndLogParam<float>(ParamNames::FPS, 30);
     declareAndLogParam<int>(ParamNames::MAX_Q_SIZE, 8);
     declareAndLogParam<std::string>(ParamNames::CALIBRATION_FILE, "");

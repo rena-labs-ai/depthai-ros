@@ -76,7 +76,7 @@ struct ImgPublisherConfig {
     bool publishCompressed = false;
     bool logLatency = false;
     int pngLevel = 3;
-    bool enableCompressedDepth = true;
+    bool enableCompressed = true;
 };
 }  // namespace utils
 }  // namespace depthai_ros_driver

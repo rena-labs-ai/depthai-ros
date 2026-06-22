@@ -90,6 +90,8 @@ void Camera::setupQueues(std::shared_ptr<dai::Device> device) {
         pubConfig.height = ph->getParam<int>(ParamNames::HEIGHT);
         pubConfig.maxQSize = ph->getParam<int>(ParamNames::MAX_Q_SIZE);
         pubConfig.publishCompressed = ph->getParam<bool>(ParamNames::PUBLISH_COMPRESSED);
+        pubConfig.enableCompressed = ph->getParam<bool>("i_enable_compressed");
+        pubConfig.logLatency = ph->getParam<bool>("i_log_latency");
 
         rgbPub->setup(device, convConfig, pubConfig);
     }
