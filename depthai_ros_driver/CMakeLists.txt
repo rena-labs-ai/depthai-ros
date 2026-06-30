@@ -22,6 +22,12 @@ find_package(ament_cmake_auto REQUIRED)
 find_package(backward_ros REQUIRED)
 ament_auto_find_build_dependencies()
 
+# compressed_depth_image_transport ships its PNG-depth codec only as a plugin lib
+# (no exported CMake target), so link it by file for the in-driver encode timing.
+find_library(COMPRESSED_DEPTH_IMAGE_TRANSPORT_LIB
+  NAMES compressed_depth_image_transport
+  REQUIRED)
+
 include_directories(include)
 
 set(COMMON_LIB_NAME ${PROJECT_NAME}_common)
@@ -55,6 +61,7 @@ target_link_libraries(
   depthai_bridge_v3::depthai_bridge_v3
   depthai_v3::core
   image_transport::image_transport
+  ${COMPRESSED_DEPTH_IMAGE_TRANSPORT_LIB}
   rclcpp::rclcpp
   diagnostic_updater::diagnostic_updater
   ${diagnostic_msgs_TARGETS}

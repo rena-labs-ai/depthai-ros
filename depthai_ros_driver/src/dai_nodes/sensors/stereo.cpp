@@ -357,6 +357,9 @@ void Stereo::setupStereoQueue(std::shared_ptr<dai::Device> device) {
     pubConf.lazyPub = ph->getParam<bool>(ParamNames::ENABLE_LAZY_PUBLISHER);
     pubConf.maxQSize = ph->getParam<int>(ParamNames::MAX_Q_SIZE);
     pubConf.publishCompressed = ph->getParam<bool>(ParamNames::PUBLISH_COMPRESSED);
+    pubConf.logLatency = ph->getParam<bool>("i_log_latency");
+    pubConf.pngLevel = ph->getParam<int>("i_depth_png_level");
+    pubConf.enableCompressed = ph->getParam<bool>("i_enable_compressed");
 
     stereoPub->setup(device, convConfig, pubConf);
     if(ph->getParam<bool>("i_use_neural_depth")) {

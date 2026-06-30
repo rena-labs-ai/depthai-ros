@@ -2,7 +2,18 @@
 
 #include <rclcpp/logging.hpp>
 
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <numeric>
+
 #include "camera_info_manager/camera_info_manager.hpp"
+#include "compressed_depth_image_transport/codec.h"
+#if __has_include("cv_bridge/cv_bridge.hpp")
+    #include "cv_bridge/cv_bridge.hpp"
+#else
+    #include "cv_bridge/cv_bridge.h"
+#endif
 #include "depthai/device/Device.hpp"
 #include "depthai/pipeline/Pipeline.hpp"
 #include "depthai/pipeline/node/VideoEncoder.hpp"
@@ -17,6 +28,24 @@
 namespace depthai_ros_driver {
 namespace dai_nodes {
 namespace sensor_helpers {
+namespace {
+const char* usbSpeedStr(dai::UsbSpeed s) {
+    switch(s) {
+        case dai::UsbSpeed::LOW:
+            return "LOW";
+        case dai::UsbSpeed::FULL:
+            return "FULL";
+        case dai::UsbSpeed::HIGH:
+            return "HIGH (USB2)";
+        case dai::UsbSpeed::SUPER:
+            return "SUPER (USB3)";
+        case dai::UsbSpeed::SUPER_PLUS:
+            return "SUPER_PLUS (USB3)";
+        default:
+            return "UNKNOWN";
+    }
+}
+}  // namespace
 ImagePublisher::ImagePublisher(std::shared_ptr<rclcpp::Node> node,
                                std::shared_ptr<dai::Pipeline> pipeline,
                                const std::string& qName,
@@ -40,14 +69,39 @@ void ImagePublisher::setup(std::shared_ptr<dai::Device> device, const utils::Img
     }
     rclcpp::PublisherOptions pubOptions;
     pubOptions.qos_overriding_options = rclcpp::QosOverridingOptions::with_default_policies();
+    rclcpp::QoS imgQos(10);
     if(pubConfig.publishCompressed) {
         if(encConfig.profile == dai::VideoEncoderProperties::Profile::MJPEG) {
             compressedImgPub =
-                node->create_publisher<sensor_msgs::msg::CompressedImage>(pubConfig.topicName + pubConfig.compressedTopicSuffix, rclcpp::QoS(10), pubOptions);
+                node->create_publisher<sensor_msgs::msg::CompressedImage>(pubConfig.topicName + pubConfig.compressedTopicSuffix, imgQos, pubOptions);
         } else {
             ffmpegPub = node->create_publisher<ffmpeg_image_transport_msgs::msg::FFMPEGPacket>(
-                pubConfig.topicName + pubConfig.compressedTopicSuffix, rclcpp::QoS(10), pubOptions);
+                pubConfig.topicName + pubConfig.compressedTopicSuffix, imgQos, pubOptions);
         }
+        infoPub =
+            node->create_publisher<sensor_msgs::msg::CameraInfo>(pubConfig.topicName + pubConfig.infoSuffix + "/camera_info", rclcpp::QoS(10), pubOptions);
+    } else if(pubConfig.logLatency) {
+        // Own raw + compressed + info publishers so the host encode and the DDS write can
+        // be timed separately (image_transport fuses both inside one opaque publish call).
+        // Both depth and color get a compressed leg when enabled: depth -> compressedDepth
+        // (PNG), color -> compressed (JPEG). Each leg's encode is timed in publish() below.
+        imgPub = node->create_publisher<sensor_msgs::msg::Image>(pubConfig.topicName + pubConfig.topicSuffix, imgQos, pubOptions);
+        if(pubConfig.enableCompressed) {
+            if(convConfig.isStereo) {
+                compressedImgPub = node->create_publisher<sensor_msgs::msg::CompressedImage>(
+                    pubConfig.topicName + pubConfig.topicSuffix + "/compressedDepth", imgQos, pubOptions);
+            } else {
+                compressedImgPub =
+                    node->create_publisher<sensor_msgs::msg::CompressedImage>(pubConfig.topicName + pubConfig.compressedTopicSuffix, imgQos, pubOptions);
+            }
+        }
+        infoPub =
+            node->create_publisher<sensor_msgs::msg::CameraInfo>(pubConfig.topicName + pubConfig.infoSuffix + "/camera_info", rclcpp::QoS(10), pubOptions);
+    } else if(!pubConfig.enableCompressed) {
+        // Compressed transport disabled: advertise raw image + info only, so the driver
+        // never host-encodes or publishes a compressed/compressedDepth topic for this
+        // stream regardless of subscribers (applies to rgb and stereo alike).
+        imgPub = node->create_publisher<sensor_msgs::msg::Image>(pubConfig.topicName + pubConfig.topicSuffix, imgQos, pubOptions);
         infoPub =
             node->create_publisher<sensor_msgs::msg::CameraInfo>(pubConfig.topicName + pubConfig.infoSuffix + "/camera_info", rclcpp::QoS(10), pubOptions);
     } else {
@@ -60,6 +114,13 @@ void ImagePublisher::setup(std::shared_ptr<dai::Device> device, const utils::Img
             dataQ = out->createOutputQueue(pubConf.maxQSize, pubConf.qBlocking);
         }
         addQueueCB();
+    }
+    if(pubConfig.logLatency) {
+        RCLCPP_INFO(node->get_logger(),
+                    "[lat %s] USB link: %s | output queue max size: %d",
+                    qName.c_str(),
+                    usbSpeedStr(device->getUsbSpeed()),
+                    pubConfig.maxQSize);
     }
 }
 
@@ -211,6 +272,10 @@ void ImagePublisher::publish(std::shared_ptr<Image> img) {
             ffmpegPub->publish(std::move(img->ffmpegPacket));
         }
         infoPub->publish(std::move(img->info));
+    } else if(!pubConfig.enableCompressed) {
+        // Compressed transport disabled: raw image + info only (no imgPubIT exists).
+        imgPub->publish(std::move(img->image));
+        infoPub->publish(std::move(img->info));
     } else {
         if(ipcEnabled && (!pubConfig.lazyPub || detectSubscription(imgPub, infoPub))) {
             imgPub->publish(std::move(img->image));
@@ -236,9 +301,106 @@ void ImagePublisher::publish(std::shared_ptr<Image> img, rclcpp::Time timestamp)
 
 void ImagePublisher::publish(const std::shared_ptr<dai::ADatatype>& data) {
     if(rclcpp::ok()) {
+        if(!pubConfig.logLatency) {
+            auto img = convertData(data);
+            publish(img);
+            return;
+        }
+        // Timed path: capture->callback (on-device compute + USB), ROS-msg
+        // conversion, and publish (incl. compressedDepth PNG encode on the host).
+        auto entry = node->now();
+        // Backlog still waiting in the host output queue when this callback fired:
+        // ~full => host consumer too slow; ~0 but dev+usb high => device/USB upstream.
+        double qSize = static_cast<double>(dataQ ? dataQ->getSize() : 0);
+        auto t0 = std::chrono::steady_clock::now();
         auto img = convertData(data);
-        publish(img);
+        auto t1 = std::chrono::steady_clock::now();
+        rclcpp::Time capture(img->info->header.stamp);
+        auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        // Compressed-enabled streams encode the frame ourselves (same codec the
+        // image_transport plugin uses) then do the compressed DDS write, so encode vs
+        // publish are timed independently: depth -> compressedDepth (PNG), color -> JPEG.
+        // Streams with compression disabled just time the raw publish; encode stays 0.
+        double encodeMs = 0.0;
+        double publishMs = 0.0;
+        if(convConfig.isStereo && pubConfig.enableCompressed) {
+            auto compressed =
+                compressed_depth_image_transport::encodeCompressedDepthImage(*img->image, 10.0, 100.0, pubConfig.pngLevel);
+            auto t2 = std::chrono::steady_clock::now();
+            encodeMs = ms(t1, t2);
+            if(compressed) {
+                compressed->header = img->image->header;
+                compressedImgPub->publish(*compressed);
+            }
+            publishMs = ms(t2, std::chrono::steady_clock::now());
+            imgPub->publish(std::move(img->image));
+            infoPub->publish(std::move(img->info));
+        } else if(pubConfig.enableCompressed && compressedImgPub) {
+            // Color: host JPEG-encode via cv_bridge (convert to bgr8 so OpenCV's encoder
+            // gets the channel order it expects), matching the compressed_image_transport
+            // plugin output the lazy image_transport path would otherwise produce.
+            sensor_msgs::msg::CompressedImage::SharedPtr compressed;
+            try {
+                compressed = cv_bridge::toCvCopy(*img->image, "bgr8")->toCompressedImageMsg();
+            } catch(const std::exception& e) {
+                RCLCPP_DEBUG(node->get_logger(), "Failed to JPEG-encode %s: %s", qName.c_str(), e.what());
+            }
+            auto t2 = std::chrono::steady_clock::now();
+            encodeMs = ms(t1, t2);
+            if(compressed) {
+                compressed->header = img->image->header;
+                compressedImgPub->publish(*compressed);
+            }
+            publishMs = ms(t2, std::chrono::steady_clock::now());
+            imgPub->publish(std::move(img->image));
+            infoPub->publish(std::move(img->info));
+        } else {
+            auto t2 = std::chrono::steady_clock::now();
+            imgPub->publish(std::move(img->image));
+            infoPub->publish(std::move(img->info));
+            publishMs = ms(t2, std::chrono::steady_clock::now());
+        }
+        recordLatency((entry - capture).seconds() * 1e3, ms(t0, t1), encodeMs, publishMs, qSize);
     }
+}
+
+void ImagePublisher::recordLatency(double devUsbMs, double convertMs, double encodeMs, double publishMs, double queueSize) {
+    latDevUsb.push_back(devUsbMs);
+    latConvert.push_back(convertMs);
+    latEncode.push_back(encodeMs);
+    latPublish.push_back(publishMs);
+    latTotal.push_back(devUsbMs + convertMs + encodeMs + publishMs);
+    latQSize.push_back(queueSize);
+    constexpr size_t kN = 30;  // ~1s at 30fps
+    if(latTotal.size() < kN) {
+        return;
+    }
+    auto stat = [](std::vector<double>& v) {
+        double mn = *std::min_element(v.begin(), v.end());
+        double mx = *std::max_element(v.begin(), v.end());
+        double avg = std::accumulate(v.begin(), v.end(), 0.0) / static_cast<double>(v.size());
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "%.1f/%.1f/%.1f", mn, avg, mx);
+        return std::string(buf);
+    };
+    RCLCPP_INFO(node->get_logger(),
+                "[lat %s n=%zu ms min/avg/max] dev+usb %s | convert %s | encode %s | publish %s | TOTAL %s | qsize %s",
+                qName.c_str(),
+                latTotal.size(),
+                stat(latDevUsb).c_str(),
+                stat(latConvert).c_str(),
+                stat(latEncode).c_str(),
+                stat(latPublish).c_str(),
+                stat(latTotal).c_str(),
+                stat(latQSize).c_str());
+    latDevUsb.clear();
+    latConvert.clear();
+    latEncode.clear();
+    latPublish.clear();
+    latTotal.clear();
+    latQSize.clear();
 }
 
 bool ImagePublisher::detectSubscription(const rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr& pub,

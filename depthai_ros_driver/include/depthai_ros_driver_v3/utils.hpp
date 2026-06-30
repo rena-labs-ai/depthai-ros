@@ -74,6 +74,9 @@ struct ImgPublisherConfig {
     int maxQSize = 8;
     bool qBlocking = false;
     bool publishCompressed = false;
+    bool logLatency = false;
+    int pngLevel = 3;
+    bool enableCompressed = true;
 };
 }  // namespace utils
 }  // namespace depthai_ros_driver
