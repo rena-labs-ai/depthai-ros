@@ -304,7 +304,10 @@ void Stereo::setupRectQueue(std::shared_ptr<dai::Device> device,
     pubConfig.undistorted = true;
     pubConfig.width = ph->getOtherNodeParam<int>(sensorName, "i_width");
     pubConfig.height = ph->getOtherNodeParam<int>(sensorName, "i_height");
-    pubConfig.topicName = "~/" + sensorName;
+    // Own namespace: image_transport derives camera_info as the base topic's
+    // sibling, so "~/left/image_rect" would collide with the raw publisher's
+    // "~/left/camera_info" (raw and rectified calibration interleaving).
+    pubConfig.topicName = "~/" + sensorName + "_rect";
     pubConfig.topicSuffix = rsCompatibilityMode() ? "/image_rect_raw" : "/image_rect";
     pubConfig.maxQSize = ph->getOtherNodeParam<int>(sensorName, "i_max_q_size");
     pubConfig.socket = sensorInfo.socket;
