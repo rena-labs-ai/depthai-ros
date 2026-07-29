@@ -297,6 +297,13 @@ void Stereo::setupRectQueue(std::shared_ptr<dai::Device> device,
     convConfig.addExposureOffset = ph->getParam<bool>(isLeft ? "i_left_rect_add_exposure_offset" : "i_right_rect_add_exposure_offset");
     convConfig.expOffset = static_cast<dai::CameraExposureOffset>(ph->getParam<int>(isLeft ? "i_left_rect_exposure_offset" : "i_right_rect_exposure_offset"));
     convConfig.reverseSocketOrder = ph->getParam<bool>("i_reverse_stereo_socket_order");
+    // Mirror the device's rectification intrinsics: with alpha scaling set,
+    // the mesh rectifies into a getOptimalNewCameraMatrix camera, and the
+    // published info must describe that camera, not the raw socket K.
+    convConfig.alphaScalingEnabled = ph->getParam<bool>("i_enable_alpha_scaling");
+    if(convConfig.alphaScalingEnabled) {
+        convConfig.alphaScaling = ph->getParam<double>("i_alpha_scaling");
+    }
 
     utils::ImgPublisherConfig pubConfig;
     pubConfig.daiNodeName = sensorName;
