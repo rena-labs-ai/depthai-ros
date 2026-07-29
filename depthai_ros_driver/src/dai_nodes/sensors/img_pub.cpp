@@ -176,7 +176,9 @@ std::shared_ptr<dai::node::VideoEncoder> ImagePublisher::createEncoder(std::shar
 void ImagePublisher::createInfoManager(std::shared_ptr<dai::Device> device) {
     infoManager = std::make_shared<camera_info_manager::CameraInfoManager>(
         node->create_sub_node(std::string(node->get_name()) + "/" + pubConfig.daiNodeName).get(), "/" + pubConfig.daiNodeName + pubConfig.infoMgrSuffix);
-    if(pubConfig.calibrationFile.empty()) {
+    if(pubConfig.hasOverrideInfo) {
+        infoManager->setCameraInfo(pubConfig.overrideInfo);
+    } else if(pubConfig.calibrationFile.empty()) {
         auto calHandler = device->readCalibration();
         auto info = sensor_helpers::getCalibInfo(node->get_logger(), converter, calHandler, pubConfig.socket, pubConfig.width, pubConfig.height);
         if(pubConfig.rectified) {
@@ -219,7 +221,7 @@ std::shared_ptr<Image> ImagePublisher::convertData(const std::shared_ptr<dai::AD
     auto img = std::make_shared<Image>();
     if(encConfig.enabled) {
         auto daiImg = std::dynamic_pointer_cast<dai::EncodedFrame>(data);
-        if(pubConfig.calibrationFile.empty()) {
+        if(pubConfig.calibrationFile.empty() && !pubConfig.hasOverrideInfo) {
             info = converter->generateCameraInfo(daiImg);
         } else {
             info = infoManager->getCameraInfo();
@@ -244,7 +246,7 @@ std::shared_ptr<Image> ImagePublisher::convertData(const std::shared_ptr<dai::AD
         }
     } else {
         auto daiImg = std::dynamic_pointer_cast<dai::ImgFrame>(data);
-        if(pubConfig.calibrationFile.empty()) {
+        if(pubConfig.calibrationFile.empty() && !pubConfig.hasOverrideInfo) {
             info = converter->generateCameraInfo(daiImg);
         } else {
             info = infoManager->getCameraInfo();
@@ -254,10 +256,10 @@ std::shared_ptr<Image> ImagePublisher::convertData(const std::shared_ptr<dai::AD
         sensor_msgs::msg::Image::UniquePtr msg = std::make_unique<sensor_msgs::msg::Image>(rawMsg);
         img->image = std::move(msg);
     }
-    if(pubConfig.rectified) {
+    if(pubConfig.rectified && !pubConfig.hasOverrideInfo) {
         info.r[0] = info.r[4] = info.r[8] = 1.0;
     }
-    if(pubConfig.undistorted) {
+    if(pubConfig.undistorted && !pubConfig.hasOverrideInfo) {
         std::fill(info.d.begin(), info.d.end(), 0.0);
     }
     sensor_msgs::msg::CameraInfo::UniquePtr infoMsg = std::make_unique<sensor_msgs::msg::CameraInfo>(info);
