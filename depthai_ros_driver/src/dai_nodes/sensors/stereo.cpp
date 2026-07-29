@@ -335,11 +335,13 @@ void Stereo::setupRectQueue(std::shared_ptr<dai::Device> device,
         cv::Mat K2 = toCv(calHandler.getCameraIntrinsics(rightSensInfo.socket, w, h), 3, 3);
         auto d1 = calHandler.getDistortionCoefficients(leftSensInfo.socket);
         auto d2 = calHandler.getDistortionCoefficients(rightSensInfo.socket);
+        // The firmware mesh uses only the first 8 distortion coefficients
+        // (StereoDepthProperties), so truncating a 14-coeff perspective model
+        // here keeps this computation identical to the mesh. Fisheye sensors
+        // return just 4 coefficients — copy what exists, zero-pad the rest.
         cv::Mat D1 = cv::Mat::zeros(1, 8, CV_64F), D2 = cv::Mat::zeros(1, 8, CV_64F);
-        for(int i = 0; i < 8; i++) {
-            D1.at<double>(i) = d1[i];
-            D2.at<double>(i) = d2[i];
-        }
+        for(size_t i = 0; i < 8 && i < d1.size(); i++) D1.at<double>(i) = d1[i];
+        for(size_t i = 0; i < 8 && i < d2.size(); i++) D2.at<double>(i) = d2[i];
         auto ext = calHandler.getCameraExtrinsics(leftSensInfo.socket, rightSensInfo.socket);
         cv::Mat R(3, 3, CV_64F), T(3, 1, CV_64F);
         for(int i = 0; i < 3; i++) {
