@@ -6,6 +6,7 @@
 #include <unordered_map>
 
 #include "depthai/common/CameraBoardSocket.hpp"
+#include "sensor_msgs/msg/camera_info.hpp"
 #include "depthai/common/CameraExposureOffset.hpp"
 #include "depthai/pipeline/datatype/ImgFrame.hpp"
 #include "depthai/properties/VideoEncoderProperties.hpp"
@@ -77,6 +78,11 @@ struct ImgPublisherConfig {
     bool logLatency = false;
     int pngLevel = 3;
     bool enableCompressed = true;
+    // Publish exactly this camera_info instead of deriving one from the
+    // calibration (rect streams: the firmware mesh camera differs from the
+    // EEPROM-stored rectification data).
+    bool hasOverrideInfo = false;
+    sensor_msgs::msg::CameraInfo overrideInfo;
 };
 }  // namespace utils
 }  // namespace depthai_ros_driver

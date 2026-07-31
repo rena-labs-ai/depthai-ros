@@ -21,6 +21,7 @@
 #include "depthai_ros_driver_v3/param_handlers/base_param_handler.hpp"
 #include "depthai_ros_driver_v3/param_handlers/stereo_param_handler.hpp"
 #include "depthai_ros_driver_v3/utils.hpp"
+#include "opencv2/calib3d.hpp"
 #include "rclcpp/node.hpp"
 
 namespace depthai_ros_driver {
@@ -313,6 +314,60 @@ void Stereo::setupRectQueue(std::shared_ptr<dai::Device> device,
     pubConfig.socket = sensorInfo.socket;
     pubConfig.infoMgrSuffix = "rect";
     pubConfig.publishCompressed = ph->getParam<bool>(isLeft ? "i_left_rect_publish_compressed" : "i_right_rect_publish_compressed");
+
+    // The firmware rectifies BOTH streams into the LEFT camera's intrinsics,
+    // with R1/R2 re-derived from the extrinsics via cv::stereoRectify — the
+    // EEPROM-stored rectification rotations are not what the mesh uses, so an
+    // info derived from them misses the actual rectified geometry by several
+    // pixels. Publish the mesh camera instead (validated by raw->rect feature
+    // reprojection at <1 px).
+    {
+        auto calHandler = device->readCalibration();
+        auto toCv = [](const std::vector<std::vector<float>>& m, int rows, int cols) {
+            cv::Mat out(rows, cols, CV_64F);
+            for(int i = 0; i < rows; i++)
+                for(int j = 0; j < cols; j++) out.at<double>(i, j) = m[i][j];
+            return out;
+        };
+        const int w = pubConfig.width;
+        const int h = pubConfig.height;
+        cv::Mat K1 = toCv(calHandler.getCameraIntrinsics(leftSensInfo.socket, w, h), 3, 3);
+        cv::Mat K2 = toCv(calHandler.getCameraIntrinsics(rightSensInfo.socket, w, h), 3, 3);
+        auto d1 = calHandler.getDistortionCoefficients(leftSensInfo.socket);
+        auto d2 = calHandler.getDistortionCoefficients(rightSensInfo.socket);
+        // The firmware mesh uses only the first 8 distortion coefficients
+        // (StereoDepthProperties), so truncating a 14-coeff perspective model
+        // here keeps this computation identical to the mesh. Fisheye sensors
+        // return just 4 coefficients — copy what exists, zero-pad the rest.
+        cv::Mat D1 = cv::Mat::zeros(1, 8, CV_64F), D2 = cv::Mat::zeros(1, 8, CV_64F);
+        for(size_t i = 0; i < 8 && i < d1.size(); i++) D1.at<double>(i) = d1[i];
+        for(size_t i = 0; i < 8 && i < d2.size(); i++) D2.at<double>(i) = d2[i];
+        auto ext = calHandler.getCameraExtrinsics(leftSensInfo.socket, rightSensInfo.socket);
+        cv::Mat R(3, 3, CV_64F), T(3, 1, CV_64F);
+        for(int i = 0; i < 3; i++) {
+            for(int j = 0; j < 3; j++) R.at<double>(i, j) = ext[i][j];
+            T.at<double>(i) = ext[i][3] / 100.0;  // cm -> m
+        }
+        cv::Mat R1, R2, P1, P2, Q;
+        cv::stereoRectify(K1, D1, K2, D2, cv::Size(w, h), R, T, R1, R2, P1, P2, Q);
+
+        sensor_msgs::msg::CameraInfo info;
+        info.width = w;
+        info.height = h;
+        info.distortion_model = "plumb_bob";
+        info.d.assign(8, 0.0);
+        const cv::Mat& Rrect = isLeft ? R1 : R2;
+        for(int i = 0; i < 3; i++) {
+            for(int j = 0; j < 3; j++) {
+                info.k[i * 3 + j] = K1.at<double>(i, j);
+                info.r[i * 3 + j] = Rrect.at<double>(i, j);
+                info.p[i * 4 + j] = K1.at<double>(i, j);
+            }
+        }
+        info.p[3] = isLeft ? 0.0 : -K1.at<double>(0, 0) * cv::norm(T);
+        pubConfig.overrideInfo = info;
+        pubConfig.hasOverrideInfo = true;
+    }
 
     pub->setup(device, convConfig, pubConfig);
 }
