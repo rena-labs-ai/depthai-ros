@@ -22,6 +22,11 @@
 #include "depthai_ros_driver_v3/param_handlers/stereo_param_handler.hpp"
 #include "depthai_ros_driver_v3/utils.hpp"
 #include "opencv2/calib3d.hpp"
+
+#include "geometry_msgs/msg/transform_stamped.hpp"
+#include "tf2/LinearMath/Matrix3x3.h"
+#include "tf2/LinearMath/Quaternion.h"
+#include "tf2_ros/static_transform_broadcaster.h"
 #include "rclcpp/node.hpp"
 
 namespace depthai_ros_driver {
@@ -287,7 +292,10 @@ void Stereo::setupRectQueue(std::shared_ptr<dai::Device> device,
                             std::shared_ptr<sensor_helpers::ImagePublisher> pub,
                             bool isLeft) {
     auto sensorName = getSocketName(sensorInfo.socket);
-    auto tfPrefix = getOpticalFrameName(sensorName);
+    // The rectified stream lives in the mesh camera's frame, rotated from the
+    // physical sensor by R1/R2 — stamp it with its own optical frame; the
+    // static TF below anchors it to the sensor frame.
+    auto tfPrefix = getOpticalFrameName(sensorName + "_rect");
     utils::ImgConverterConfig convConfig;
     convConfig.tfPrefix = tfPrefix;
     convConfig.interleaved = false;
@@ -367,6 +375,33 @@ void Stereo::setupRectQueue(std::shared_ptr<dai::Device> device,
         info.p[3] = isLeft ? 0.0 : -K1.at<double>(0, 0) * cv::norm(T);
         pubConfig.overrideInfo = info;
         pubConfig.hasOverrideInfo = true;
+
+        // camera_info.r maps sensor-frame points into the rectified frame
+        // (x_rect = R * x_cam), so the child frame's orientation in the
+        // sensor frame is R^T.
+        if(!rectTfBroadcaster) {
+            rectTfBroadcaster = std::make_shared<tf2_ros::StaticTransformBroadcaster>(getROSNode());
+        }
+        tf2::Matrix3x3 rectRot(Rrect.at<double>(0, 0),
+                               Rrect.at<double>(0, 1),
+                               Rrect.at<double>(0, 2),
+                               Rrect.at<double>(1, 0),
+                               Rrect.at<double>(1, 1),
+                               Rrect.at<double>(1, 2),
+                               Rrect.at<double>(2, 0),
+                               Rrect.at<double>(2, 1),
+                               Rrect.at<double>(2, 2));
+        tf2::Quaternion q;
+        rectRot.transpose().getRotation(q);
+        geometry_msgs::msg::TransformStamped tfMsg;
+        tfMsg.header.stamp = getROSNode()->get_clock()->now();
+        tfMsg.header.frame_id = getOpticalFrameName(sensorName);
+        tfMsg.child_frame_id = tfPrefix;
+        tfMsg.transform.rotation.x = q.x();
+        tfMsg.transform.rotation.y = q.y();
+        tfMsg.transform.rotation.z = q.z();
+        tfMsg.transform.rotation.w = q.w();
+        rectTfBroadcaster->sendTransform(tfMsg);
     }
 
     pub->setup(device, convConfig, pubConfig);

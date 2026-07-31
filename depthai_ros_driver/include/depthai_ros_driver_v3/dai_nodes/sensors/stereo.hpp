@@ -1,5 +1,9 @@
 #pragma once
 
+namespace tf2_ros {
+class StaticTransformBroadcaster;
+}  // namespace tf2_ros
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -84,6 +88,7 @@ class Stereo : public BaseNode {
     void setupRightRectQueue(std::shared_ptr<dai::Device> device);
     void setupRectQueue(std::shared_ptr<dai::Device> device, dai::CameraFeatures& sensorInfo, std::shared_ptr<sensor_helpers::ImagePublisher> pub, bool isLeft);
     std::shared_ptr<sensor_helpers::ImagePublisher> stereoPub, leftRectPub, rightRectPub, confidencePub;
+    std::shared_ptr<tf2_ros::StaticTransformBroadcaster> rectTfBroadcaster;
     StereoNodeWrapper stereoNodeWrapper;
     std::shared_ptr<dai::node::StereoDepth> stereoCamNode;
     std::shared_ptr<dai::node::NeuralDepth> neuralDepthNode;
