@@ -331,7 +331,10 @@ void Stereo::computeRectifyRecipe(std::shared_ptr<dai::Device> device) {
             rectifyPRight[i * 4 + j] = K1.at<double>(i, j);
         }
     }
-    rectifyPRight[3] = -K1.at<double>(0, 0) * cv::norm(T);
+    // Signed baseline from stereoRectify's own P2 (Tx flips with reversed
+    // socket order), rescaled to the mesh camera's focal since our P carries
+    // left-K rather than stereoRectify's projection.
+    rectifyPRight[3] = K1.at<double>(0, 0) * (P2.at<double>(0, 3) / P2.at<double>(0, 0));
 }
 
 void Stereo::setupRectQueue(std::shared_ptr<dai::Device> device,
