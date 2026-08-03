@@ -4,6 +4,7 @@ namespace tf2_ros {
 class StaticTransformBroadcaster;
 }  // namespace tf2_ros
 
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
@@ -87,6 +88,9 @@ class Stereo : public BaseNode {
     void setupLeftRectQueue(std::shared_ptr<dai::Device> device);
     void setupRightRectQueue(std::shared_ptr<dai::Device> device);
     void setupRectQueue(std::shared_ptr<dai::Device> device, dai::CameraFeatures& sensorInfo, std::shared_ptr<sensor_helpers::ImagePublisher> pub, bool isLeft);
+    void computeRectifyRecipe(std::shared_ptr<dai::Device> device);
+    std::array<double, 9> rectifyRLeft{}, rectifyRRight{};
+    std::array<double, 12> rectifyPLeft{}, rectifyPRight{};
     std::shared_ptr<sensor_helpers::ImagePublisher> stereoPub, leftRectPub, rightRectPub, confidencePub;
     std::shared_ptr<tf2_ros::StaticTransformBroadcaster> rectTfBroadcaster;
     StereoNodeWrapper stereoNodeWrapper;

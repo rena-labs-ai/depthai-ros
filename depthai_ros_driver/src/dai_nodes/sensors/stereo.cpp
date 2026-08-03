@@ -287,6 +287,53 @@ void Stereo::setInOut(std::shared_ptr<dai::Pipeline> pipeline) {
     }
 }
 
+// The firmware rectifies BOTH streams into the LEFT camera's intrinsics, with
+// R1/R2 re-derived from the extrinsics via cv::stereoRectify — the EEPROM-stored
+// rectification rotations are not what the mesh uses, so an info derived from
+// them misses the actual rectified geometry by several pixels. Derive the same
+// recipe once here: the rect infos publish its result, and the raw infos carry
+// it as their R/P so self-rectifying consumers land in the mesh geometry.
+void Stereo::computeRectifyRecipe(std::shared_ptr<dai::Device> device) {
+    auto calHandler = device->readCalibration();
+    auto toCv = [](const std::vector<std::vector<float>>& m, int rows, int cols) {
+        cv::Mat out(rows, cols, CV_64F);
+        for(int i = 0; i < rows; i++)
+            for(int j = 0; j < cols; j++) out.at<double>(i, j) = m[i][j];
+        return out;
+    };
+    const int w = ph->getOtherNodeParam<int>(getSocketName(leftSensInfo.socket), "i_width");
+    const int h = ph->getOtherNodeParam<int>(getSocketName(leftSensInfo.socket), "i_height");
+    cv::Mat K1 = toCv(calHandler.getCameraIntrinsics(leftSensInfo.socket, w, h), 3, 3);
+    cv::Mat K2 = toCv(calHandler.getCameraIntrinsics(rightSensInfo.socket, w, h), 3, 3);
+    auto d1 = calHandler.getDistortionCoefficients(leftSensInfo.socket);
+    auto d2 = calHandler.getDistortionCoefficients(rightSensInfo.socket);
+    // The firmware mesh uses only the first 8 distortion coefficients
+    // (StereoDepthProperties), so truncating a 14-coeff perspective model
+    // here keeps this computation identical to the mesh. Fisheye sensors
+    // return just 4 coefficients — copy what exists, zero-pad the rest.
+    cv::Mat D1 = cv::Mat::zeros(1, 8, CV_64F), D2 = cv::Mat::zeros(1, 8, CV_64F);
+    for(size_t i = 0; i < 8 && i < d1.size(); i++) D1.at<double>(i) = d1[i];
+    for(size_t i = 0; i < 8 && i < d2.size(); i++) D2.at<double>(i) = d2[i];
+    auto ext = calHandler.getCameraExtrinsics(leftSensInfo.socket, rightSensInfo.socket);
+    cv::Mat R(3, 3, CV_64F), T(3, 1, CV_64F);
+    for(int i = 0; i < 3; i++) {
+        for(int j = 0; j < 3; j++) R.at<double>(i, j) = ext[i][j];
+        T.at<double>(i) = ext[i][3] / 100.0;  // cm -> m
+    }
+    cv::Mat R1, R2, P1, P2, Q;
+    cv::stereoRectify(K1, D1, K2, D2, cv::Size(w, h), R, T, R1, R2, P1, P2, Q);
+
+    for(int i = 0; i < 3; i++) {
+        for(int j = 0; j < 3; j++) {
+            rectifyRLeft[i * 3 + j] = R1.at<double>(i, j);
+            rectifyRRight[i * 3 + j] = R2.at<double>(i, j);
+            rectifyPLeft[i * 4 + j] = K1.at<double>(i, j);
+            rectifyPRight[i * 4 + j] = K1.at<double>(i, j);
+        }
+    }
+    rectifyPRight[3] = -K1.at<double>(0, 0) * cv::norm(T);
+}
+
 void Stereo::setupRectQueue(std::shared_ptr<dai::Device> device,
                             dai::CameraFeatures& sensorInfo,
                             std::shared_ptr<sensor_helpers::ImagePublisher> pub,
@@ -323,56 +370,25 @@ void Stereo::setupRectQueue(std::shared_ptr<dai::Device> device,
     pubConfig.infoMgrSuffix = "rect";
     pubConfig.publishCompressed = ph->getParam<bool>(isLeft ? "i_left_rect_publish_compressed" : "i_right_rect_publish_compressed");
 
-    // The firmware rectifies BOTH streams into the LEFT camera's intrinsics,
-    // with R1/R2 re-derived from the extrinsics via cv::stereoRectify — the
-    // EEPROM-stored rectification rotations are not what the mesh uses, so an
-    // info derived from them misses the actual rectified geometry by several
-    // pixels. Publish the mesh camera instead (validated by raw->rect feature
+    // The firmware rectifies BOTH streams into the LEFT camera's intrinsics
+    // (see computeRectifyRecipe) — publish the mesh camera instead of an info
+    // derived from the EEPROM-stored rotations (validated by raw->rect feature
     // reprojection at <1 px).
     {
-        auto calHandler = device->readCalibration();
-        auto toCv = [](const std::vector<std::vector<float>>& m, int rows, int cols) {
-            cv::Mat out(rows, cols, CV_64F);
-            for(int i = 0; i < rows; i++)
-                for(int j = 0; j < cols; j++) out.at<double>(i, j) = m[i][j];
-            return out;
-        };
-        const int w = pubConfig.width;
-        const int h = pubConfig.height;
-        cv::Mat K1 = toCv(calHandler.getCameraIntrinsics(leftSensInfo.socket, w, h), 3, 3);
-        cv::Mat K2 = toCv(calHandler.getCameraIntrinsics(rightSensInfo.socket, w, h), 3, 3);
-        auto d1 = calHandler.getDistortionCoefficients(leftSensInfo.socket);
-        auto d2 = calHandler.getDistortionCoefficients(rightSensInfo.socket);
-        // The firmware mesh uses only the first 8 distortion coefficients
-        // (StereoDepthProperties), so truncating a 14-coeff perspective model
-        // here keeps this computation identical to the mesh. Fisheye sensors
-        // return just 4 coefficients — copy what exists, zero-pad the rest.
-        cv::Mat D1 = cv::Mat::zeros(1, 8, CV_64F), D2 = cv::Mat::zeros(1, 8, CV_64F);
-        for(size_t i = 0; i < 8 && i < d1.size(); i++) D1.at<double>(i) = d1[i];
-        for(size_t i = 0; i < 8 && i < d2.size(); i++) D2.at<double>(i) = d2[i];
-        auto ext = calHandler.getCameraExtrinsics(leftSensInfo.socket, rightSensInfo.socket);
-        cv::Mat R(3, 3, CV_64F), T(3, 1, CV_64F);
-        for(int i = 0; i < 3; i++) {
-            for(int j = 0; j < 3; j++) R.at<double>(i, j) = ext[i][j];
-            T.at<double>(i) = ext[i][3] / 100.0;  // cm -> m
-        }
-        cv::Mat R1, R2, P1, P2, Q;
-        cv::stereoRectify(K1, D1, K2, D2, cv::Size(w, h), R, T, R1, R2, P1, P2, Q);
-
+        const auto& Rrect = isLeft ? rectifyRLeft : rectifyRRight;
+        const auto& P = isLeft ? rectifyPLeft : rectifyPRight;
         sensor_msgs::msg::CameraInfo info;
-        info.width = w;
-        info.height = h;
+        info.width = pubConfig.width;
+        info.height = pubConfig.height;
         info.distortion_model = "plumb_bob";
         info.d.assign(8, 0.0);
-        const cv::Mat& Rrect = isLeft ? R1 : R2;
         for(int i = 0; i < 3; i++) {
             for(int j = 0; j < 3; j++) {
-                info.k[i * 3 + j] = K1.at<double>(i, j);
-                info.r[i * 3 + j] = Rrect.at<double>(i, j);
-                info.p[i * 4 + j] = K1.at<double>(i, j);
+                info.k[i * 3 + j] = P[i * 4 + j];
+                info.r[i * 3 + j] = Rrect[i * 3 + j];
             }
         }
-        info.p[3] = isLeft ? 0.0 : -K1.at<double>(0, 0) * cv::norm(T);
+        info.p = P;
         pubConfig.overrideInfo = info;
         pubConfig.hasOverrideInfo = true;
 
@@ -382,15 +398,7 @@ void Stereo::setupRectQueue(std::shared_ptr<dai::Device> device,
         if(!rectTfBroadcaster) {
             rectTfBroadcaster = std::make_shared<tf2_ros::StaticTransformBroadcaster>(getROSNode());
         }
-        tf2::Matrix3x3 rectRot(Rrect.at<double>(0, 0),
-                               Rrect.at<double>(0, 1),
-                               Rrect.at<double>(0, 2),
-                               Rrect.at<double>(1, 0),
-                               Rrect.at<double>(1, 1),
-                               Rrect.at<double>(1, 2),
-                               Rrect.at<double>(2, 0),
-                               Rrect.at<double>(2, 1),
-                               Rrect.at<double>(2, 2));
+        tf2::Matrix3x3 rectRot(Rrect[0], Rrect[1], Rrect[2], Rrect[3], Rrect[4], Rrect[5], Rrect[6], Rrect[7], Rrect[8]);
         tf2::Quaternion q;
         rectRot.transpose().getRotation(q);
         geometry_msgs::msg::TransformStamped tfMsg;
@@ -489,6 +497,14 @@ void Stereo::setupConfidenceQueue(std::shared_ptr<dai::Device> device) {
 }
 
 void Stereo::setupQueues(std::shared_ptr<dai::Device> device) {
+    computeRectifyRecipe(device);
+    // Raw K/D stay the sensor's own; R/P carry the rectification recipe.
+    for(auto& pub : left->getPublishers()) {
+        pub->setRectifyOverride(rectifyRLeft, rectifyPLeft);
+    }
+    for(auto& pub : right->getPublishers()) {
+        pub->setRectifyOverride(rectifyRRight, rectifyPRight);
+    }
     left->setupQueues(device);
     right->setupQueues(device);
     if(ph->getParam<bool>("i_publish_topic")) {
