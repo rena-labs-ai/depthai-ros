@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <string>
 #include <vector>
 
@@ -76,6 +77,12 @@ class ImagePublisher {
      * Creates Publishers, ImageConverter and CameraInfoManager. Creates a Queue and adds a callback if not synced.
      */
     void setup(std::shared_ptr<dai::Device> device, const utils::ImgConverterConfig& convConf, const utils::ImgPublisherConfig& pubConf);
+    /**
+     * @brief Override the camera_info R/P of a raw stereo-pair stream with the
+     * rectification recipe actually applied by the firmware mesh (K/D stay the
+     * sensor's own). Survives setup(); applied to every published info.
+     */
+    void setRectifyOverride(const std::array<double, 9>& r, const std::array<double, 12>& p);
     void createImageConverter(std::shared_ptr<dai::Device> device);
     void createInfoManager(std::shared_ptr<dai::Device> device);
     void addQueueCB();
@@ -103,6 +110,9 @@ class ImagePublisher {
     std::vector<double> latTotal;
     std::vector<double> latQSize;
     std::shared_ptr<rclcpp::Node> node;
+    bool hasRectifyOverride = false;
+    std::array<double, 9> rectifyR{};
+    std::array<double, 12> rectifyP{};
     utils::VideoEncoderConfig encConfig;
     utils::ImgPublisherConfig pubConfig;
     utils::ImgConverterConfig convConfig;

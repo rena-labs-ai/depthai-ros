@@ -190,6 +190,12 @@ void ImagePublisher::createInfoManager(std::shared_ptr<dai::Device> device) {
         infoManager->loadCameraInfo(pubConfig.calibrationFile);
     }
 };
+void ImagePublisher::setRectifyOverride(const std::array<double, 9>& r, const std::array<double, 12>& p) {
+    rectifyR = r;
+    rectifyP = p;
+    hasRectifyOverride = true;
+}
+
 ImagePublisher::~ImagePublisher() {
     closeQueue();
 };
@@ -261,6 +267,10 @@ std::shared_ptr<Image> ImagePublisher::convertData(const std::shared_ptr<dai::AD
     }
     if(pubConfig.undistorted && !pubConfig.hasOverrideInfo) {
         std::fill(info.d.begin(), info.d.end(), 0.0);
+    }
+    if(hasRectifyOverride) {
+        std::copy(rectifyR.begin(), rectifyR.end(), info.r.begin());
+        std::copy(rectifyP.begin(), rectifyP.end(), info.p.begin());
     }
     sensor_msgs::msg::CameraInfo::UniquePtr infoMsg = std::make_unique<sensor_msgs::msg::CameraInfo>(info);
     img->info = std::move(infoMsg);
