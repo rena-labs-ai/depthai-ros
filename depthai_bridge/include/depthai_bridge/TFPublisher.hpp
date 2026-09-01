@@ -31,7 +31,8 @@ class TFPublisher {
                          const std::string& imuFromDescr = "false",
                          const std::string& customURDFLocation = "",
                          const std::string& customXacroArgs = "",
-                         const bool rsCompatibilityMode = false);
+                         const bool rsCompatibilityMode = false,
+                         const std::string& referenceSocketName = "");
     /**
      * @brief Obtain URDF description by running Xacro with provided arguments.
      */
@@ -44,6 +45,11 @@ class TFPublisher {
      * @brief Converts model name to one of the available model families
      */
     void convertModelName();
+    /**
+     * @brief Resolve i_tf_reference_socket to a socket on this device. False
+     * when unset or absent, in which case the EEPROM extrinsic chain is used.
+     */
+    bool findReferenceSocket(nlohmann::json camData, dai::CameraBoardSocket& socket) const;
     /**
      * @brief Prepare arguments for xacro command. If custom URDF location is not provided, check if model name is available in depthai_descriptions package.
      */
@@ -86,6 +92,7 @@ class TFPublisher {
     std::string customXacroArgs;
     std::vector<dai::CameraFeatures> camFeatures;
     bool rsCompatibilityMode;
+    std::string referenceSocketName;
     rclcpp::Logger logger;
 };
 }  // namespace depthai_bridge
