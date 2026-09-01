@@ -60,6 +60,17 @@ void DriverParamHandler::declareParams() {
     declareAndLogParam<std::string>("i_tf_device_model", "");
     declareAndLogParam<std::string>("i_tf_base_frame", "oak");
     declareAndLogParam<std::string>("i_tf_parent_frame", "oak_parent_frame");
+    // Which sensor the base frame coincides with, by the same name the frames
+    // use ("left"/"right"/"rgb", or "infra1"/"infra2"/"color" under
+    // i_rs_compat). Empty keeps the historical behaviour: the base frame lands
+    // on whichever socket happens to end the EEPROM extrinsic chain, which on
+    // a device rooted at CAM_A means the base frame IS the RGB sensor.
+    //
+    // Setting it re-expresses every sensor against that one, so a consumer
+    // that calibrates against a specific lens can hand its pose straight to
+    // i_tf_cam_pos_*/i_tf_cam_* instead of correcting for a body->lens
+    // transform it has to discover at runtime.
+    declareAndLogParam<std::string>("i_tf_reference_socket", "");
     declareAndLogParam<std::string>("i_tf_cam_pos_x", "0.0");
     declareAndLogParam<std::string>("i_tf_cam_pos_y", "0.0");
     declareAndLogParam<std::string>("i_tf_cam_pos_z", "0.0");

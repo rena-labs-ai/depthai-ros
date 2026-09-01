@@ -35,7 +35,8 @@ TFPublisher::TFPublisher(std::shared_ptr<rclcpp::Node> node,
                          const std::string& imuFromDescr,
                          const std::string& customURDFLocation,
                          const std::string& customXacroArgs,
-                         const bool rsCompatibilityMode)
+                         const bool rsCompatibilityMode,
+                         const std::string& referenceSocketName)
     : camName(camName),
       nodeName(node->get_name()),
       camModel(camModel),
@@ -52,6 +53,7 @@ TFPublisher::TFPublisher(std::shared_ptr<rclcpp::Node> node,
       customURDFLocation(customURDFLocation),
       customXacroArgs(customXacroArgs),
       rsCompatibilityMode(rsCompatibilityMode),
+      referenceSocketName(referenceSocketName),
       logger(node->get_logger()) {
     tfPub = std::make_shared<tf2_ros::StaticTransformBroadcaster>(node);
 
@@ -79,7 +81,29 @@ void TFPublisher::publishDescription() {
     RCLCPP_INFO(logger, "Published URDF");
 }
 
+bool TFPublisher::findReferenceSocket(nlohmann::json camData, dai::CameraBoardSocket& socket) const {
+    if(referenceSocketName.empty()) {
+        return false;
+    }
+    for(auto& cam : camData) {
+        auto candidate = static_cast<dai::CameraBoardSocket>(cam[0].get<int>());
+        if(getSocketName(candidate, camModel, rsCompatibilityMode) == referenceSocketName) {
+            socket = candidate;
+            return true;
+        }
+    }
+    RCLCPP_WARN(logger,
+                "i_tf_reference_socket is '%s' but this device has no such sensor; falling back to the "
+                "EEPROM extrinsic chain",
+                referenceSocketName.c_str());
+    return false;
+}
 void TFPublisher::publishCamTransforms(nlohmann::json camData, std::shared_ptr<rclcpp::Node> node, const dai::CalibrationHandler& calHandler) {
+    dai::CameraBoardSocket referenceSocket;
+    const bool reRoot = findReferenceSocket(camData, referenceSocket);
+    if(reRoot) {
+        RCLCPP_INFO(logger, "Base frame [ %s ] set to the '%s' sensor", baseFrame.c_str(), referenceSocketName.c_str());
+    }
     for(auto& cam : camData) {
         geometry_msgs::msg::TransformStamped ts;
         geometry_msgs::msg::TransformStamped opticalTS;
@@ -87,27 +111,38 @@ void TFPublisher::publishCamTransforms(nlohmann::json camData, std::shared_ptr<r
         opticalTS.header.stamp = ts.header.stamp;
         auto extrinsics = cam[1]["extrinsics"];
         auto currCam = static_cast<dai::CameraBoardSocket>(cam[0].get<int>());
-        if(extrinsics["toCameraSocket"] != -1) {
-            auto toCam = static_cast<dai::CameraBoardSocket>(extrinsics["toCameraSocket"].get<int>());
-            auto extrMat = calHandler.getCameraExtrinsics(currCam, toCam, false);
-            ts.transform.rotation = quatFromRotM(extrMat);
-            auto trans = calHandler.getCameraTranslationVector(currCam, toCam, false);
-            ts.transform.translation = transFromExtr(trans);
-        }
-
-        std::string name = getSocketName(static_cast<dai::CameraBoardSocket>(cam[0]), camModel, rsCompatibilityMode);
+        std::string name = getSocketName(currCam, camModel, rsCompatibilityMode);
         ts.child_frame_id = nodeName + std::string("_") + name + std::string("_camera_frame");
-        // check if the camera is at the end of the chain
-        if(extrinsics["toCameraSocket"] != -1) {
-            ts.header.frame_id = getFrameName(
-                nodeName,
-                getSocketName(static_cast<dai::CameraBoardSocket>(extrinsics["toCameraSocket"].get<int>()), camModel, rsCompatibilityMode) + "_camera_frame");
+
+        // Re-rooted: every sensor hangs directly off the reference sensor, which
+        // itself coincides with the base frame. Flatter than walking the EEPROM
+        // chain, and it means the rig arguments position the sensor a consumer
+        // actually calibrates against rather than whichever socket ends the
+        // chain.
+        if(reRoot) {
+            if(currCam == referenceSocket) {
+                ts.header.frame_id = baseFrame;
+                ts.transform.rotation.w = 1.0;
+            } else {
+                ts.header.frame_id =
+                    getFrameName(nodeName, getSocketName(referenceSocket, camModel, rsCompatibilityMode) + "_camera_frame");
+                ts.transform.rotation = quatFromRotM(calHandler.getCameraExtrinsics(currCam, referenceSocket, false));
+                ts.transform.translation = transFromExtr(calHandler.getCameraTranslationVector(currCam, referenceSocket, false));
+            }
         } else {
-            ts.header.frame_id = baseFrame;
-            ts.transform.rotation.w = 1.0;
-            ts.transform.rotation.x = 0.0;
-            ts.transform.rotation.y = 0.0;
-            ts.transform.rotation.z = 0.0;
+            if(extrinsics["toCameraSocket"] != -1) {
+                auto toCam = static_cast<dai::CameraBoardSocket>(extrinsics["toCameraSocket"].get<int>());
+                ts.transform.rotation = quatFromRotM(calHandler.getCameraExtrinsics(currCam, toCam, false));
+                ts.transform.translation = transFromExtr(calHandler.getCameraTranslationVector(currCam, toCam, false));
+                ts.header.frame_id = getFrameName(nodeName, getSocketName(toCam, camModel, rsCompatibilityMode) + "_camera_frame");
+            } else {
+                // end of the chain
+                ts.header.frame_id = baseFrame;
+                ts.transform.rotation.w = 1.0;
+                ts.transform.rotation.x = 0.0;
+                ts.transform.rotation.y = 0.0;
+                ts.transform.rotation.z = 0.0;
+            }
         }
         // rotate optical fransform
         opticalTS.child_frame_id = getOpticalFrameName(nodeName, name, rsCompatibilityMode);
