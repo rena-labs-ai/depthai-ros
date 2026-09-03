@@ -1,5 +1,7 @@
 #include "depthai_ros_driver_v3/dai_nodes/sensors/stereo.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <optional>
 #include <stdexcept>
 
@@ -22,6 +24,9 @@
 #include "depthai_ros_driver_v3/param_handlers/stereo_param_handler.hpp"
 #include "depthai_ros_driver_v3/utils.hpp"
 #include "opencv2/calib3d.hpp"
+#include "opencv2/imgproc.hpp"
+#include "cv_bridge/cv_bridge.h"
+#include "sensor_msgs/image_encodings.hpp"
 
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "tf2/LinearMath/Matrix3x3.h"
@@ -322,6 +327,10 @@ void Stereo::computeRectifyRecipe(std::shared_ptr<dai::Device> device) {
     }
     cv::Mat R1, R2, P1, P2, Q;
     cv::stereoRectify(K1, D1, K2, D2, cv::Size(w, h), R, T, R1, R2, P1, P2, Q);
+    rectifyKLeft = K1.clone();
+    rectifyKRight = K2.clone();
+    rectifyDLeft = D1.clone();
+    rectifyDRight = D2.clone();
 
     for(int i = 0; i < 3; i++) {
         for(int j = 0; j < 3; j++) {
@@ -416,6 +425,126 @@ void Stereo::setupRectQueue(std::shared_ptr<dai::Device> device,
     }
 
     pub->setup(device, convConfig, pubConfig);
+}
+
+void Stereo::setupWideRectQueues() {
+    const int w = ph->getOtherNodeParam<int>(getSocketName(leftSensInfo.socket), "i_width");
+    const int h = ph->getOtherNodeParam<int>(getSocketName(leftSensInfo.socket), "i_height");
+    cv::Mat R1(3, 3, CV_64F), R2(3, 3, CV_64F);
+    for(int i = 0; i < 9; i++) {
+        R1.at<double>(i / 3, i % 3) = rectifyRLeft[i];
+        R2.at<double>(i / 3, i % 3) = rectifyRRight[i];
+    }
+    // Where the raw content ends in the rectified frame, along the rectified
+    // principal row/column (normalized coordinates). For a barrel lens the
+    // outline bulges outward at the corners, so these four points bound the
+    // largest rectangle fully inside the content. Found by bisection on the
+    // forward model, exact for any distortion strength.
+    auto extents = [&](const cv::Mat& K, const cv::Mat& D, const cv::Mat& R) {
+        auto pixel = [&](double x, double y, int axis) {
+            cv::Mat ray = R.t() * (cv::Mat_<double>(3, 1) << x, y, 1.0);
+            std::vector<cv::Point3d> obj{cv::Point3d(ray.at<double>(0), ray.at<double>(1), ray.at<double>(2))};
+            std::vector<cv::Point2d> img;
+            cv::projectPoints(obj, cv::Vec3d(0, 0, 0), cv::Vec3d(0, 0, 0), K, D, img);
+            return axis == 0 ? img[0].x : img[0].y;
+        };
+        auto edge = [&](int axis, double target) {
+            const double sign = target == 0.0 ? -1.0 : 1.0;
+            double lo = 0.0, hi = 8.0;
+            for(int i = 0; i < 200; i++) {
+                const double m = (lo + hi) / 2;
+                const double px = axis == 0 ? pixel(sign * m, 0.0, 0) : pixel(0.0, sign * m, 1);
+                const bool inside = target == 0.0 ? px > 0.0 : px < target;
+                (inside ? lo : hi) = m;
+            }
+            return sign * lo;
+        };
+        return std::array<double, 4>{edge(0, 0.0), edge(0, w - 1.0), edge(1, 0.0), edge(1, h - 1.0)};
+    };
+    const auto eL = extents(rectifyKLeft, rectifyDLeft, R1);
+    const auto eR = extents(rectifyKRight, rectifyDRight, R2);
+    const double xmin = std::max(eL[0], eR[0]), xmax = std::min(eL[1], eR[1]);
+    const double ymin = std::max(eL[2], eR[2]), ymax = std::min(eL[3], eR[3]);
+    const double margin = 0.01;
+    const double fx = w / (xmax - xmin) * (1.0 - margin);
+    const double fy = h / (ymax - ymin) * (1.0 - margin);
+    const double cx = -xmin * fx + (w - fx * (xmax - xmin)) / 2.0;
+    const double cy = -ymin * fy + (h - fy * (ymax - ymin)) / 2.0;
+    const double baseline = -rectifyPRight[3] / rectifyPLeft[0];  // signed, from the recipe
+    const double hfov = (std::atan((w - cx) / fx) + std::atan(cx / fx)) * 180.0 / M_PI;
+    const double hfovMesh = (std::atan((w - rectifyPLeft[2]) / rectifyPLeft[0]) + std::atan(rectifyPLeft[2] / rectifyPLeft[0])) * 180.0 / M_PI;
+    RCLCPP_INFO(getLogger(),
+                "wide rect: %dx%d, HFOV %.0f deg (firmware rect %.0f deg), fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
+                w, h, hfov, hfovMesh, fx, fy, cx, cy);
+
+    auto setupSide = [&](WideRect& wr, dai::Node::Output* out, const dai::CameraFeatures& sensorInfo, const cv::Mat& K, const cv::Mat& D,
+                         const cv::Mat& R, bool isLeft) {
+        const auto sensorName = getSocketName(sensorInfo.socket);
+        cv::Mat P = (cv::Mat_<double>(3, 4) << fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0);
+        if(!isLeft) P.at<double>(0, 3) = -fx * baseline;
+        cv::initUndistortRectifyMap(K, D, R, P, cv::Size(w, h), CV_16SC2, wr.map1, wr.map2);
+
+        wr.info = sensor_msgs::msg::CameraInfo();
+        wr.info.width = w;
+        wr.info.height = h;
+        wr.info.distortion_model = "plumb_bob";
+        wr.info.d.assign(8, 0.0);
+        for(int i = 0; i < 3; i++) {
+            for(int j = 0; j < 3; j++) {
+                wr.info.k[i * 3 + j] = P.at<double>(i, j);
+                wr.info.r[i * 3 + j] = R.at<double>(i, j);
+            }
+            for(int j = 0; j < 4; j++) wr.info.p[i * 4 + j] = P.at<double>(i, j);
+        }
+        // Same rectified frame as the firmware rect (same R), so the static TF
+        // published by setupRectQueue covers this stream too.
+        wr.conv = std::make_shared<depthai_bridge::ImageConverter>(getOpticalFrameName(sensorName + "_rect"), false, ph->getParam<bool>("i_get_base_device_timestamp"));
+        wr.conv->setUpdateRosBaseTimeOnToRosMsg(ph->getParam<bool>("i_update_ros_base_time_on_ros_msg"));
+        if(ph->getParam<bool>("i_reverse_stereo_socket_order")) {
+            wr.conv->reverseStereoSocketOrder();
+        }
+        wr.pub = image_transport::create_camera_publisher(getROSNode().get(), "~/" + sensorName + "_rect_wide/image_rect");
+        wr.q = out->createOutputQueue(ph->getParam<int>(param_handlers::ParamNames::MAX_Q_SIZE), false);
+        wr.cbId = wr.q->addCallback([this, isLeft](const std::shared_ptr<dai::ADatatype>& data) { publishWideRect(data, isLeft); });
+    };
+    setupSide(wideLeft, leftOut, leftSensInfo, rectifyKLeft, rectifyDLeft, R1, true);
+    setupSide(wideRight, rightOut, rightSensInfo, rectifyKRight, rectifyDRight, R2, false);
+}
+
+void Stereo::publishWideRect(const std::shared_ptr<dai::ADatatype>& data, bool isLeft) {
+    auto& wr = isLeft ? wideLeft : wideRight;
+    if(wr.pub.getNumSubscribers() == 0) {
+        return;
+    }
+    auto frame = std::dynamic_pointer_cast<dai::ImgFrame>(data);
+    if(!frame) {
+        return;
+    }
+    // The converter owns timestamp/frame_id semantics (device->ROS time base,
+    // socket order); we only re-sample its pixels.
+    auto raw = wr.conv->toRosMsgRawPtr(frame);
+    cv_bridge::CvImagePtr gray;
+    try {
+        gray = cv_bridge::toCvCopy(raw, sensor_msgs::image_encodings::MONO8);
+    } catch(const std::exception& e) {
+        if(!wr.warned) {
+            RCLCPP_WARN(getLogger(), "wide rect: cannot convert %s frames to mono8: %s", raw.encoding.c_str(), e.what());
+            wr.warned = true;
+        }
+        return;
+    }
+    if(gray->image.cols != wr.map1.cols || gray->image.rows != wr.map1.rows) {
+        if(!wr.warned) {
+            RCLCPP_WARN(getLogger(), "wide rect: frame %dx%d does not match the %dx%d recipe; not publishing", gray->image.cols, gray->image.rows, wr.map1.cols, wr.map1.rows);
+            wr.warned = true;
+        }
+        return;
+    }
+    cv::Mat rect;
+    cv::remap(gray->image, rect, wr.map1, wr.map2, cv::INTER_LINEAR);
+    auto msg = cv_bridge::CvImage(raw.header, sensor_msgs::image_encodings::MONO8, rect).toImageMsg();
+    wr.info.header = raw.header;
+    wr.pub.publish(*msg, wr.info);
 }
 
 void Stereo::setupLeftRectQueue(std::shared_ptr<dai::Device> device) {
@@ -528,6 +657,9 @@ void Stereo::setupQueues(std::shared_ptr<dai::Device> device) {
     if(ph->getParam<bool>("i_right_rect_publish_topic")) {
         setupRightRectQueue(device);
     }
+    if(ph->getParam<bool>("i_rect_wide_publish_topic")) {
+        setupWideRectQueues();
+    }
     if(ph->getParam<bool>("i_left_rect_enable_feature_tracker")) {
         featureTrackerLeftR->setupQueues(device);
     }
@@ -561,6 +693,12 @@ void Stereo::closeQueues() {
     }
     if(ph->getParam<bool>("i_right_rect_publish_topic")) {
         rightRectPub->closeQueue();
+    }
+    for(auto* wr : {&wideLeft, &wideRight}) {
+        if(wr->q && !wr->q->isClosed()) {
+            wr->q->removeCallback(wr->cbId);
+            wr->q->close();
+        }
     }
     if(ph->getParam<bool>("i_left_rect_enable_feature_tracker")) {
         featureTrackerLeftR->closeQueues();

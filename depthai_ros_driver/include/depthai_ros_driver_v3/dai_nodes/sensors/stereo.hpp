@@ -4,6 +4,10 @@ namespace tf2_ros {
 class StaticTransformBroadcaster;
 }  // namespace tf2_ros
 
+#include "depthai_bridge/ImageConverter.hpp"
+#include "image_transport/image_transport.hpp"
+#include "opencv2/core.hpp"
+#include "sensor_msgs/msg/camera_info.hpp"
 #include <array>
 #include <memory>
 #include <string>
@@ -91,6 +95,25 @@ class Stereo : public BaseNode {
     void computeRectifyRecipe(std::shared_ptr<dai::Device> device);
     std::array<double, 9> rectifyRLeft{}, rectifyRRight{};
     std::array<double, 12> rectifyPLeft{}, rectifyPRight{};
+    // Raw intrinsics (at i_width x i_height) and the 8-coefficient distortion
+    // the recipe was computed with; the host wide rect rebuilds from these.
+    cv::Mat rectifyKLeft, rectifyKRight, rectifyDLeft, rectifyDRight;
+    // Host-side "wide" rectification: same R1/R2 as the firmware mesh, but the
+    // projection is the largest sensor-size rectangle fully inside the raw
+    // content (anisotropic focal), so the whole lens FOV survives with no black
+    // borders. Published next to the firmware rect as <side>_rect_wide.
+    struct WideRect {
+        std::shared_ptr<dai::MessageQueue> q;
+        int cbId = -1;
+        cv::Mat map1, map2;
+        sensor_msgs::msg::CameraInfo info;
+        std::shared_ptr<depthai_bridge::ImageConverter> conv;
+        image_transport::CameraPublisher pub;
+        bool warned = false;
+    };
+    WideRect wideLeft, wideRight;
+    void setupWideRectQueues();
+    void publishWideRect(const std::shared_ptr<dai::ADatatype>& data, bool isLeft);
     std::shared_ptr<sensor_helpers::ImagePublisher> stereoPub, leftRectPub, rightRectPub, confidencePub;
     std::shared_ptr<tf2_ros::StaticTransformBroadcaster> rectTfBroadcaster;
     StereoNodeWrapper stereoNodeWrapper;
