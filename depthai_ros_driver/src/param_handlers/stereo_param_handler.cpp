@@ -67,6 +67,9 @@ StereoParamHandler::StereoParamHandler(std::shared_ptr<rclcpp::Node> node, const
     declareAndLogParam<std::string>(ParamNames::CALIBRATION_FILE, "");
 
     declareAndLogParam<bool>("i_left_rect_publish_topic", false);
+    // Host-rectified full-FOV stereo pair (<side>_rect_wide), for visual
+    // odometry; the firmware rect stays as is for depth.
+    declareAndLogParam<bool>("i_rect_wide_publish_topic", false);
     declareAndLogParam<bool>("i_left_rect_low_bandwidth", false);
     declareAndLogParam<int>("i_left_rect_low_bandwidth_profile", 4);
     declareAndLogParam<int>("i_left_rect_low_bandwidth_frame_freq", 30);
