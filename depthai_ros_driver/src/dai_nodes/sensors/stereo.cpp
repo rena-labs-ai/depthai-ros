@@ -329,8 +329,8 @@ void Stereo::computeRectifyRecipe(std::shared_ptr<dai::Device> device) {
     cv::stereoRectify(K1, D1, K2, D2, cv::Size(w, h), R, T, R1, R2, P1, P2, Q);
     rectifyKLeft = K1.clone();
     rectifyKRight = K2.clone();
-    rectifyDLeft = D1.clone();
-    rectifyDRight = D2.clone();
+    cv::Mat(d1).reshape(1, 1).convertTo(rawDLeft, CV_64F);
+    cv::Mat(d2).reshape(1, 1).convertTo(rawDRight, CV_64F);
 
     for(int i = 0; i < 3; i++) {
         for(int j = 0; j < 3; j++) {
@@ -461,8 +461,22 @@ void Stereo::setupWideRectQueues() {
         };
         return std::array<double, 4>{edge(0, 0.0), edge(0, w - 1.0), edge(1, 0.0), edge(1, h - 1.0)};
     };
-    const auto eL = extents(rectifyKLeft, rectifyDLeft, R1);
-    const auto eR = extents(rectifyKRight, rectifyDRight, R2);
+    // The lens model the host maps undistort with. The firmware mesh (and the
+    // recipe above) stop at 8 coefficients; the EEPROM written by the
+    // rena-commission calibration carries the 14-coefficient rational+tilt
+    // model, and truncating it is not the same lens: on a 129 deg OAK-W the
+    // dropped terms are 1-2 px at the periphery this stream exists to keep.
+    // Default: the full stored model. 8 reproduces the firmware truncation.
+    const int coefficients = ph->getParam<int>("i_rect_wide_distortion_coefficients");
+    auto model = [&](const cv::Mat& raw) {
+        const int n = std::min(coefficients, raw.cols);
+        cv::Mat D = cv::Mat::zeros(1, std::max(n, 4), CV_64F);
+        raw.colRange(0, n).copyTo(D.colRange(0, n));
+        return D;
+    };
+    const cv::Mat DL = model(rawDLeft), DR = model(rawDRight);
+    const auto eL = extents(rectifyKLeft, DL, R1);
+    const auto eR = extents(rectifyKRight, DR, R2);
     const double xmin = std::max(eL[0], eR[0]), xmax = std::min(eL[1], eR[1]);
     const double ymin = std::max(eL[2], eR[2]), ymax = std::min(eL[3], eR[3]);
     const double margin = 0.01;
@@ -474,8 +488,8 @@ void Stereo::setupWideRectQueues() {
     const double hfov = (std::atan((w - cx) / fx) + std::atan(cx / fx)) * 180.0 / M_PI;
     const double hfovMesh = (std::atan((w - rectifyPLeft[2]) / rectifyPLeft[0]) + std::atan(rectifyPLeft[2] / rectifyPLeft[0])) * 180.0 / M_PI;
     RCLCPP_INFO(getLogger(),
-                "wide rect: %dx%d, HFOV %.0f deg (firmware rect %.0f deg), fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
-                w, h, hfov, hfovMesh, fx, fy, cx, cy);
+                "wide rect: %dx%d, HFOV %.0f deg (firmware rect %.0f deg), fx=%.1f fy=%.1f cx=%.1f cy=%.1f, %d distortion coefficients",
+                w, h, hfov, hfovMesh, fx, fy, cx, cy, DL.cols);
 
     auto setupSide = [&](WideRect& wr, dai::Node::Output* out, const dai::CameraFeatures& sensorInfo, const cv::Mat& K, const cv::Mat& D,
                          const cv::Mat& R, bool isLeft) {
@@ -507,8 +521,8 @@ void Stereo::setupWideRectQueues() {
         wr.q = out->createOutputQueue(ph->getParam<int>(param_handlers::ParamNames::MAX_Q_SIZE), false);
         wr.cbId = wr.q->addCallback([this, isLeft](const std::shared_ptr<dai::ADatatype>& data) { publishWideRect(data, isLeft); });
     };
-    setupSide(wideLeft, leftOut, leftSensInfo, rectifyKLeft, rectifyDLeft, R1, true);
-    setupSide(wideRight, rightOut, rightSensInfo, rectifyKRight, rectifyDRight, R2, false);
+    setupSide(wideLeft, leftOut, leftSensInfo, rectifyKLeft, DL, R1, true);
+    setupSide(wideRight, rightOut, rightSensInfo, rectifyKRight, DR, R2, false);
 }
 
 void Stereo::publishWideRect(const std::shared_ptr<dai::ADatatype>& data, bool isLeft) {

@@ -95,9 +95,10 @@ class Stereo : public BaseNode {
     void computeRectifyRecipe(std::shared_ptr<dai::Device> device);
     std::array<double, 9> rectifyRLeft{}, rectifyRRight{};
     std::array<double, 12> rectifyPLeft{}, rectifyPRight{};
-    // Raw intrinsics (at i_width x i_height) and the 8-coefficient distortion
-    // the recipe was computed with; the host wide rect rebuilds from these.
-    cv::Mat rectifyKLeft, rectifyKRight, rectifyDLeft, rectifyDRight;
+    // Raw intrinsics (at i_width x i_height) and the stored distortion model
+    // (all coefficients, 14 for the rational+tilt model) the host wide rect
+    // undistorts with; the firmware recipe above truncates it to 8.
+    cv::Mat rectifyKLeft, rectifyKRight, rawDLeft, rawDRight;
     // Host-side "wide" rectification: same R1/R2 as the firmware mesh, but the
     // projection is the largest sensor-size rectangle fully inside the raw
     // content (anisotropic focal), so the whole lens FOV survives with no black

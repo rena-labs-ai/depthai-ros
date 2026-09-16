@@ -70,6 +70,10 @@ StereoParamHandler::StereoParamHandler(std::shared_ptr<rclcpp::Node> node, const
     // Host-rectified full-FOV stereo pair (<side>_rect_wide), for visual
     // odometry; the firmware rect stays as is for depth.
     declareAndLogParam<bool>("i_rect_wide_publish_topic", false);
+    // Coefficients of the stored lens model the wide rect undistorts with:
+    // 14 = the full rational+tilt model, 8 = the firmware mesh's truncation
+    // (OpenCV accepts 4, 5, 8, 12 or 14).
+    declareAndLogParam<int>("i_rect_wide_distortion_coefficients", 14);
     declareAndLogParam<bool>("i_left_rect_low_bandwidth", false);
     declareAndLogParam<int>("i_left_rect_low_bandwidth_profile", 4);
     declareAndLogParam<int>("i_left_rect_low_bandwidth_frame_freq", 30);
