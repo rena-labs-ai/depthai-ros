@@ -314,10 +314,12 @@ void Stereo::computeRectifyRecipe(std::shared_ptr<dai::Device> device) {
     cv::Mat K2 = toCv(calHandler.getCameraIntrinsics(rightSensInfo.socket, w, h), 3, 3);
     auto d1 = calHandler.getDistortionCoefficients(leftSensInfo.socket);
     auto d2 = calHandler.getDistortionCoefficients(rightSensInfo.socket);
-    // The firmware mesh uses only the first 8 distortion coefficients
-    // (StereoDepthProperties), so truncating a 14-coeff perspective model
-    // here keeps this computation identical to the mesh. Fisheye sensors
-    // return just 4 coefficients — copy what exists, zero-pad the rest.
+    // Only R1/R2/P1/P2 are wanted here, and stereoRectify derives those from
+    // the extrinsics alone — the distortion never enters them (verified: R1/R2
+    // agree to 0.0e+00 whether this is given 8 coefficients or 14). So the
+    // truncation below is free, and the full model is kept in rawDLeft/Right
+    // for the maps, which do depend on it. Fisheye sensors return just 4
+    // coefficients — copy what exists, zero-pad the rest.
     cv::Mat D1 = cv::Mat::zeros(1, 8, CV_64F), D2 = cv::Mat::zeros(1, 8, CV_64F);
     for(size_t i = 0; i < 8 && i < d1.size(); i++) D1.at<double>(i) = d1[i];
     for(size_t i = 0; i < 8 && i < d2.size(); i++) D2.at<double>(i) = d2[i];
@@ -473,12 +475,14 @@ void Stereo::setupWideRectQueues() {
         };
         return std::array<double, 4>{edge(0, 0.0), edge(0, w - 1.0), edge(1, 0.0), edge(1, h - 1.0)};
     };
-    // The lens model the host maps undistort with. The firmware mesh (and the
-    // recipe above) stop at 8 coefficients; the EEPROM written by the
+    // The lens model the host maps undistort with. The EEPROM written by the
     // rena-commission calibration carries the 14-coefficient rational+tilt
     // model, and truncating it is not the same lens: on a 129 deg OAK-W the
-    // dropped terms are 1-2 px at the periphery this stream exists to keep.
-    // Default: the full stored model. 8 reproduces the firmware truncation.
+    // dropped tilt terms are 1-2 px at the periphery this stream exists to
+    // keep. The device mesh consumes all 14 as well (measured against live
+    // firmware output: rena-tools/vo_ab/firmware_rect_model.py), so the full
+    // model is also what makes this stream agree with <side>_rect where they
+    // overlap. Default: the full stored model; 8 is kept for that A/B.
     const int coefficients = ph->getParam<int>("i_host_wide_rect_distortion_coefficients");
     auto model = [&](const cv::Mat& raw) {
         const int n = std::min(coefficients, raw.cols);

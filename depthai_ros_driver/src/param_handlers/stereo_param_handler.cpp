@@ -72,8 +72,9 @@ StereoParamHandler::StereoParamHandler(std::shared_ptr<rclcpp::Node> node, const
     declareAndLogParam<bool>("i_left_device_rect_publish_topic", false);
     declareAndLogParam<bool>("i_host_wide_rect_publish_topic", false);
     // Coefficients of the stored lens model the host wide rect undistorts
-    // with: 14 = the full rational+tilt model, 8 = the firmware mesh's
-    // truncation (OpenCV accepts 4, 5, 8, 12 or 14).
+    // with (OpenCV accepts 4, 5, 8, 12 or 14). 14 = the full rational+tilt
+    // model, which is also what the device mesh uses; 8 drops the tilt terms
+    // and is only useful for measuring what they are worth.
     declareAndLogParam<int>("i_host_wide_rect_distortion_coefficients", 14);
     declareAndLogParam<bool>("i_left_rect_low_bandwidth", false);
     declareAndLogParam<int>("i_left_rect_low_bandwidth_profile", 4);
