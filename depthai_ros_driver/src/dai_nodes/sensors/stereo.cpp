@@ -4,6 +4,8 @@
 #include <cmath>
 #include <optional>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 #include "depthai/capabilities/ImgFrameCapability.hpp"
 #include "depthai/device/DeviceBase.hpp"
@@ -240,7 +242,7 @@ void Stereo::setInOut(std::shared_ptr<dai::Pipeline> pipeline) {
         confidencePub = setupOutput(pipeline, confidenceQName, &stereoCamNode->confidenceMap, ph->getParam<bool>("i_synced"), encConf);
     }
 
-    if(ph->getParam<bool>("i_left_rect_publish_topic")) {
+    if(ph->getParam<bool>("i_left_device_rect_publish_topic")) {
         utils::VideoEncoderConfig encConf;
         encConf.profile = static_cast<dai::VideoEncoderProperties::Profile>(ph->getParam<int>("i_left_rect_low_bandwidth_profile"));
         encConf.bitrate = ph->getParam<int>("i_left_rect_low_bandwidth_bitrate");
@@ -255,7 +257,7 @@ void Stereo::setInOut(std::shared_ptr<dai::Pipeline> pipeline) {
         }
     }
 
-    if(ph->getParam<bool>("i_right_rect_publish_topic")) {
+    if(ph->getParam<bool>("i_right_device_rect_publish_topic")) {
         utils::VideoEncoderConfig encConf;
         encConf.profile = static_cast<dai::VideoEncoderProperties::Profile>(ph->getParam<int>("i_right_rect_low_bandwidth_profile"));
         encConf.bitrate = ph->getParam<int>("i_right_rect_low_bandwidth_bitrate");
@@ -351,9 +353,8 @@ void Stereo::setupRectQueue(std::shared_ptr<dai::Device> device,
                             std::shared_ptr<sensor_helpers::ImagePublisher> pub,
                             bool isLeft) {
     auto sensorName = getSocketName(sensorInfo.socket);
-    // The rectified stream lives in the mesh camera's frame, rotated from the
-    // physical sensor by R1/R2 — stamp it with its own optical frame; the
-    // static TF below anchors it to the sensor frame.
+    // The rectified stream lives in the rectified camera's frame (see
+    // publishRectFrames), rotated from the physical sensor by R1/R2.
     auto tfPrefix = getOpticalFrameName(sensorName + "_rect");
     utils::ImgConverterConfig convConfig;
     convConfig.tfPrefix = tfPrefix;
@@ -404,27 +405,38 @@ void Stereo::setupRectQueue(std::shared_ptr<dai::Device> device,
         pubConfig.overrideInfo = info;
         pubConfig.hasOverrideInfo = true;
 
-        // camera_info.r maps sensor-frame points into the rectified frame
-        // (x_rect = R * x_cam), so the child frame's orientation in the
-        // sensor frame is R^T.
-        if(!rectTfBroadcaster) {
-            rectTfBroadcaster = std::make_shared<tf2_ros::StaticTransformBroadcaster>(getROSNode());
-        }
-        tf2::Matrix3x3 rectRot(Rrect[0], Rrect[1], Rrect[2], Rrect[3], Rrect[4], Rrect[5], Rrect[6], Rrect[7], Rrect[8]);
+    }
+
+    pub->setup(device, convConfig, pubConfig);
+}
+
+// One rectified frame per eye, shared by the device rect and the host wide rect:
+// both are built with the same R1/R2 and differ only in projection, so the
+// <side>_rect optical frame is anchored to the sensor frame once here, whichever
+// of the two streams is on. camera_info.r maps sensor-frame points into the
+// rectified frame (x_rect = R * x_cam), so the child's orientation is R^T.
+void Stereo::publishRectFrames() {
+    if(!rectTfBroadcaster) {
+        rectTfBroadcaster = std::make_shared<tf2_ros::StaticTransformBroadcaster>(getROSNode());
+    }
+    std::vector<geometry_msgs::msg::TransformStamped> tfs;
+    for(const auto& [sensorInfo, Rrect] : {std::pair(&leftSensInfo, &rectifyRLeft), std::pair(&rightSensInfo, &rectifyRRight)}) {
+        const auto& R = *Rrect;
+        const auto sensorName = getSocketName(sensorInfo->socket);
+        tf2::Matrix3x3 rectRot(R[0], R[1], R[2], R[3], R[4], R[5], R[6], R[7], R[8]);
         tf2::Quaternion q;
         rectRot.transpose().getRotation(q);
         geometry_msgs::msg::TransformStamped tfMsg;
         tfMsg.header.stamp = getROSNode()->get_clock()->now();
         tfMsg.header.frame_id = getOpticalFrameName(sensorName);
-        tfMsg.child_frame_id = tfPrefix;
+        tfMsg.child_frame_id = getOpticalFrameName(sensorName + "_rect");
         tfMsg.transform.rotation.x = q.x();
         tfMsg.transform.rotation.y = q.y();
         tfMsg.transform.rotation.z = q.z();
         tfMsg.transform.rotation.w = q.w();
-        rectTfBroadcaster->sendTransform(tfMsg);
+        tfs.push_back(tfMsg);
     }
-
-    pub->setup(device, convConfig, pubConfig);
+    rectTfBroadcaster->sendTransform(tfs);
 }
 
 void Stereo::setupWideRectQueues() {
@@ -467,7 +479,7 @@ void Stereo::setupWideRectQueues() {
     // model, and truncating it is not the same lens: on a 129 deg OAK-W the
     // dropped terms are 1-2 px at the periphery this stream exists to keep.
     // Default: the full stored model. 8 reproduces the firmware truncation.
-    const int coefficients = ph->getParam<int>("i_rect_wide_distortion_coefficients");
+    const int coefficients = ph->getParam<int>("i_host_wide_rect_distortion_coefficients");
     auto model = [&](const cv::Mat& raw) {
         const int n = std::min(coefficients, raw.cols);
         cv::Mat D = cv::Mat::zeros(1, std::max(n, 4), CV_64F);
@@ -510,8 +522,7 @@ void Stereo::setupWideRectQueues() {
             }
             for(int j = 0; j < 4; j++) wr.info.p[i * 4 + j] = P.at<double>(i, j);
         }
-        // Same rectified frame as the firmware rect (same R), so the static TF
-        // published by setupRectQueue covers this stream too.
+        // Same rectified frame as the device rect (same R): publishRectFrames.
         wr.conv = std::make_shared<depthai_bridge::ImageConverter>(getOpticalFrameName(sensorName + "_rect"), false, ph->getParam<bool>("i_get_base_device_timestamp"));
         wr.conv->setUpdateRosBaseTimeOnToRosMsg(ph->getParam<bool>("i_update_ros_base_time_on_ros_msg"));
         if(ph->getParam<bool>("i_reverse_stereo_socket_order")) {
@@ -665,13 +676,19 @@ void Stereo::setupQueues(std::shared_ptr<dai::Device> device) {
     if(ph->getParam<bool>("i_enable_right_rgbd")) {
         rgbdNodeRight->setupQueues(device);
     }
-    if(ph->getParam<bool>("i_left_rect_publish_topic")) {
+    const bool leftDevice = ph->getParam<bool>("i_left_device_rect_publish_topic");
+    const bool rightDevice = ph->getParam<bool>("i_right_device_rect_publish_topic");
+    const bool hostWide = ph->getParam<bool>("i_host_wide_rect_publish_topic");
+    if(leftDevice || rightDevice || hostWide) {
+        publishRectFrames();
+    }
+    if(leftDevice) {
         setupLeftRectQueue(device);
     }
-    if(ph->getParam<bool>("i_right_rect_publish_topic")) {
+    if(rightDevice) {
         setupRightRectQueue(device);
     }
-    if(ph->getParam<bool>("i_rect_wide_publish_topic")) {
+    if(hostWide) {
         setupWideRectQueues();
     }
     if(ph->getParam<bool>("i_left_rect_enable_feature_tracker")) {
@@ -702,10 +719,10 @@ void Stereo::closeQueues() {
     if(ph->getParam<bool>("i_enable_right_rgbd")) {
         rgbdNodeRight->closeQueues();
     }
-    if(ph->getParam<bool>("i_left_rect_publish_topic")) {
+    if(ph->getParam<bool>("i_left_device_rect_publish_topic")) {
         leftRectPub->closeQueue();
     }
-    if(ph->getParam<bool>("i_right_rect_publish_topic")) {
+    if(ph->getParam<bool>("i_right_device_rect_publish_topic")) {
         rightRectPub->closeQueue();
     }
     for(auto* wr : {&wideLeft, &wideRight}) {
@@ -761,10 +778,10 @@ std::vector<std::shared_ptr<sensor_helpers::ImagePublisher>> Stereo::getPublishe
     if(ph->getParam<bool>("i_publish_topic") && ph->getParam<bool>("i_synced")) {
         pubs.push_back(stereoPub);
     }
-    if(ph->getParam<bool>("i_left_rect_publish_topic") && ph->getParam<bool>("i_left_rect_synced")) {
+    if(ph->getParam<bool>("i_left_device_rect_publish_topic") && ph->getParam<bool>("i_left_rect_synced")) {
         pubs.push_back(leftRectPub);
     }
-    if(ph->getParam<bool>("i_right_rect_publish_topic") && ph->getParam<bool>("i_right_rect_synced")) {
+    if(ph->getParam<bool>("i_right_device_rect_publish_topic") && ph->getParam<bool>("i_right_rect_synced")) {
         pubs.push_back(rightRectPub);
     }
     auto pubsLeft = left->getPublishers();

@@ -93,16 +93,18 @@ class Stereo : public BaseNode {
     void setupRightRectQueue(std::shared_ptr<dai::Device> device);
     void setupRectQueue(std::shared_ptr<dai::Device> device, dai::CameraFeatures& sensorInfo, std::shared_ptr<sensor_helpers::ImagePublisher> pub, bool isLeft);
     void computeRectifyRecipe(std::shared_ptr<dai::Device> device);
+    void publishRectFrames();
     std::array<double, 9> rectifyRLeft{}, rectifyRRight{};
     std::array<double, 12> rectifyPLeft{}, rectifyPRight{};
     // Raw intrinsics (at i_width x i_height) and the stored distortion model
     // (all coefficients, 14 for the rational+tilt model) the host wide rect
     // undistorts with; the firmware recipe above truncates it to 8.
     cv::Mat rectifyKLeft, rectifyKRight, rawDLeft, rawDRight;
-    // Host-side "wide" rectification: same R1/R2 as the firmware mesh, but the
-    // projection is the largest sensor-size rectangle fully inside the raw
-    // content (anisotropic focal), so the whole lens FOV survives with no black
-    // borders. Published next to the firmware rect as <side>_rect_wide.
+    // Host-side "wide" rectification: same R1/R2 as the device (firmware) rect,
+    // but the projection is the largest sensor-size rectangle fully inside the
+    // raw content (anisotropic focal), so the whole lens FOV survives with no
+    // black borders. Published as <side>_rect_wide, independently of the device
+    // rect's <side>_rect; either or both may be on.
     struct WideRect {
         std::shared_ptr<dai::MessageQueue> q;
         int cbId = -1;
