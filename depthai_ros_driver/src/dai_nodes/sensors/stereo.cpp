@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -27,8 +28,6 @@
 #include "depthai_ros_driver_v3/utils.hpp"
 #include "opencv2/calib3d.hpp"
 #include "opencv2/imgproc.hpp"
-#include "cv_bridge/cv_bridge.h"
-#include "sensor_msgs/image_encodings.hpp"
 
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "tf2/LinearMath/Matrix3x3.h"
@@ -99,6 +98,13 @@ Stereo::Stereo(const std::string& daiNodeName,
                                                       ph->getParam<float>(ParamNames::FPS));
         leftOut->link(stereoCamNode->left);
         rightOut->link(stereoCamNode->right);
+    }
+
+    // Before the pipeline is built: the mesh is part of the device's
+    // configuration, and every published info is derived from the same recipe.
+    computeRectifyRecipe(device);
+    if(meshRectification()) {
+        uploadRectifyMesh();
     }
 
     aligned = ph->getParam<bool>(param_handlers::ParamNames::ALIGNED);
@@ -242,7 +248,7 @@ void Stereo::setInOut(std::shared_ptr<dai::Pipeline> pipeline) {
         confidencePub = setupOutput(pipeline, confidenceQName, &stereoCamNode->confidenceMap, ph->getParam<bool>("i_synced"), encConf);
     }
 
-    if(ph->getParam<bool>("i_left_device_rect_publish_topic")) {
+    if(ph->getParam<bool>("i_left_rect_publish_topic")) {
         utils::VideoEncoderConfig encConf;
         encConf.profile = static_cast<dai::VideoEncoderProperties::Profile>(ph->getParam<int>("i_left_rect_low_bandwidth_profile"));
         encConf.bitrate = ph->getParam<int>("i_left_rect_low_bandwidth_bitrate");
@@ -257,7 +263,7 @@ void Stereo::setInOut(std::shared_ptr<dai::Pipeline> pipeline) {
         }
     }
 
-    if(ph->getParam<bool>("i_right_device_rect_publish_topic")) {
+    if(ph->getParam<bool>("i_right_rect_publish_topic")) {
         utils::VideoEncoderConfig encConf;
         encConf.profile = static_cast<dai::VideoEncoderProperties::Profile>(ph->getParam<int>("i_right_rect_low_bandwidth_profile"));
         encConf.bitrate = ph->getParam<int>("i_right_rect_low_bandwidth_bitrate");
@@ -294,12 +300,22 @@ void Stereo::setInOut(std::shared_ptr<dai::Pipeline> pipeline) {
     }
 }
 
-// The firmware rectifies BOTH streams into the LEFT camera's intrinsics, with
-// R1/R2 re-derived from the extrinsics via cv::stereoRectify — the EEPROM-stored
-// rectification rotations are not what the mesh uses, so an info derived from
-// them misses the actual rectified geometry by several pixels. Derive the same
-// recipe once here: the rect infos publish its result, and the raw infos carry
-// it as their R/P so self-rectifying consumers land in the mesh geometry.
+// The rectified pair every stream in this node is expressed in.
+//
+// R1/R2 come from cv::stereoRectify on the EEPROM extrinsics — the stored
+// rectification rotations are NOT what rectification uses, so an info derived
+// from them misses the actual geometry by several pixels.
+//
+// The projection keeps the WHOLE lens: the largest sensor-sized rectangle that
+// lies inside both eyes' undistorted content, with an anisotropic focal so it
+// fills the frame. The device's own recipe projects into the left camera's K
+// instead, which crops a 129 deg OAK-W to ~97 deg and throws away the
+// periphery. `uploadRectifyMesh` hands this projection to the device as a warp
+// mesh, so <side>_rect carries it directly and no host remap is involved.
+//
+// Sizes come from the outputs actually linked into the depth node, not from the
+// sensor's own i_width/i_height: those are different parameters and a mismatch
+// would put the maps on a different grid than the frames.
 void Stereo::computeRectifyRecipe(std::shared_ptr<dai::Device> device) {
     auto calHandler = device->readCalibration();
     auto toCv = [](const std::vector<std::vector<float>>& m, int rows, int cols) {
@@ -308,18 +324,16 @@ void Stereo::computeRectifyRecipe(std::shared_ptr<dai::Device> device) {
             for(int j = 0; j < cols; j++) out.at<double>(i, j) = m[i][j];
         return out;
     };
-    const int w = ph->getOtherNodeParam<int>(getSocketName(leftSensInfo.socket), "i_width");
-    const int h = ph->getOtherNodeParam<int>(getSocketName(leftSensInfo.socket), "i_height");
+    const auto size = rectSize();
+    const int w = size.first, h = size.second;
     cv::Mat K1 = toCv(calHandler.getCameraIntrinsics(leftSensInfo.socket, w, h), 3, 3);
     cv::Mat K2 = toCv(calHandler.getCameraIntrinsics(rightSensInfo.socket, w, h), 3, 3);
     auto d1 = calHandler.getDistortionCoefficients(leftSensInfo.socket);
     auto d2 = calHandler.getDistortionCoefficients(rightSensInfo.socket);
-    // Only R1/R2/P1/P2 are wanted here, and stereoRectify derives those from
-    // the extrinsics alone — the distortion never enters them (verified: R1/R2
-    // agree to 0.0e+00 whether this is given 8 coefficients or 14). So the
-    // truncation below is free, and the full model is kept in rawDLeft/Right
-    // for the maps, which do depend on it. Fisheye sensors return just 4
-    // coefficients — copy what exists, zero-pad the rest.
+    // Only R1/R2 are wanted from stereoRectify, and it derives those from the
+    // extrinsics alone — the distortion never enters them (verified: R1/R2 agree
+    // to 0.0e+00 whether this is given 8 coefficients or 14). So truncating here
+    // is free; the full model below is what the maps need.
     cv::Mat D1 = cv::Mat::zeros(1, 8, CV_64F), D2 = cv::Mat::zeros(1, 8, CV_64F);
     for(size_t i = 0; i < 8 && i < d1.size(); i++) D1.at<double>(i) = d1[i];
     for(size_t i = 0; i < 8 && i < d2.size(); i++) D2.at<double>(i) = d2[i];
@@ -333,21 +347,198 @@ void Stereo::computeRectifyRecipe(std::shared_ptr<dai::Device> device) {
     cv::stereoRectify(K1, D1, K2, D2, cv::Size(w, h), R, T, R1, R2, P1, P2, Q);
     rectifyKLeft = K1.clone();
     rectifyKRight = K2.clone();
-    cv::Mat(d1).reshape(1, 1).convertTo(rawDLeft, CV_64F);
-    cv::Mat(d2).reshape(1, 1).convertTo(rawDRight, CV_64F);
-
+    rectifyDLeft = lensModel(d1);
+    rectifyDRight = lensModel(d2);
     for(int i = 0; i < 3; i++) {
         for(int j = 0; j < 3; j++) {
             rectifyRLeft[i * 3 + j] = R1.at<double>(i, j);
             rectifyRRight[i * 3 + j] = R2.at<double>(i, j);
-            rectifyPLeft[i * 4 + j] = K1.at<double>(i, j);
-            rectifyPRight[i * 4 + j] = K1.at<double>(i, j);
         }
     }
-    // Signed baseline from stereoRectify's own P2 (Tx flips with reversed
-    // socket order), rescaled to the mesh camera's focal since our P carries
-    // left-K rather than stereoRectify's projection.
-    rectifyPRight[3] = K1.at<double>(0, 0) * (P2.at<double>(0, 3) / P2.at<double>(0, 0));
+    // Signed baseline (Tx flips with reversed socket order), as a length: each
+    // projection below scales it by its own focal.
+    const double baseline = P2.at<double>(0, 3) / P2.at<double>(0, 0);
+
+    // The device applies whatever mesh it is given; without one it uses its own
+    // left-K recipe, and the info must say so.
+    double fx, fy, cx, cy;
+    if(meshRectification()) {
+        std::tie(fx, fy, cx, cy) = wideProjection(R1, R2, w, h);
+    } else {
+        fx = K1.at<double>(0, 0);
+        fy = K1.at<double>(1, 1);
+        cx = K1.at<double>(0, 2);
+        cy = K1.at<double>(1, 2);
+    }
+    rectifyPLeft = {fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0};
+    rectifyPRight = rectifyPLeft;
+    rectifyPRight[3] = fx * baseline;
+
+    const double hfov = (std::atan((w - cx) / fx) + std::atan(cx / fx)) * 180.0 / M_PI;
+    const double hfovK = (std::atan((w - K1.at<double>(0, 2)) / K1.at<double>(0, 0)) + std::atan(K1.at<double>(0, 2) / K1.at<double>(0, 0))) * 180.0 / M_PI;
+    RCLCPP_INFO(getLogger(),
+                "rect: %dx%d, HFOV %.0f deg (%s; the device's own left-K recipe would be %.0f deg), fx=%.1f fy=%.1f cx=%.1f cy=%.1f, %d distortion coefficients",
+                w,
+                h,
+                hfov,
+                meshRectification() ? "uploaded mesh, full lens" : "device recipe",
+                hfovK,
+                fx,
+                fy,
+                cx,
+                cy,
+                rectifyDLeft.cols);
+}
+
+// OpenCV takes 4, 5, 8, 12 or 14 distortion coefficients. The EEPROM this
+// calibration writes carries 14 (rational + tilt), and dropping the tail is not
+// the same lens: on a 129 deg OAK-W the tilt terms are worth 1-2 px at the
+// periphery this projection exists to keep. Pad whatever the sensor reports up
+// to the next accepted length rather than truncating -- a fisheye module
+// reporting 4 is as valid as a rational one reporting 14.
+cv::Mat Stereo::lensModel(const std::vector<float>& raw) const {
+    const int given = static_cast<int>(raw.size());
+    int n = 14;
+    for(int s : {4, 5, 8, 12, 14}) {
+        if(s >= given) {
+            n = s;
+            break;
+        }
+    }
+    cv::Mat D = cv::Mat::zeros(1, n, CV_64F);
+    for(int i = 0; i < std::min(given, n); i++) D.at<double>(i) = raw[i];
+    return D;
+}
+
+// The largest rectangle, in the rectified plane, whose whole BORDER maps back
+// inside both raw images -- returned as (fx, fy, cx, cy) for a sensor-sized
+// frame.
+//
+// Step 1 bisects along the rectified principal row and column for a starting
+// box. That alone is not a guarantee: tangential, thin-prism and tilt terms move
+// the content boundary off those two axes, so step 2 shrinks the box about its
+// centre until every point sampled along all four edges -- both eyes -- lands
+// inside the raw image. Without step 2 the corners can fall outside the content
+// and the device fills them with black.
+std::tuple<double, double, double, double> Stereo::wideProjection(const cv::Mat& R1, const cv::Mat& R2, int w, int h) const {
+    auto pixel = [&](const cv::Mat& K, const cv::Mat& D, const cv::Mat& R, double x, double y) {
+        cv::Mat ray = R.t() * (cv::Mat_<double>(3, 1) << x, y, 1.0);
+        std::vector<cv::Point3d> obj{cv::Point3d(ray.at<double>(0), ray.at<double>(1), ray.at<double>(2))};
+        std::vector<cv::Point2d> img;
+        cv::projectPoints(obj, cv::Vec3d(0, 0, 0), cv::Vec3d(0, 0, 0), K, D, img);
+        return img[0];
+    };
+    auto extents = [&](const cv::Mat& K, const cv::Mat& D, const cv::Mat& R) {
+        auto edge = [&](int axis, double target) {
+            const double sign = target == 0.0 ? -1.0 : 1.0;
+            double lo = 0.0, hi = 8.0;
+            for(int i = 0; i < 200; i++) {
+                const double m = (lo + hi) / 2;
+                const auto p = axis == 0 ? pixel(K, D, R, sign * m, 0.0) : pixel(K, D, R, 0.0, sign * m);
+                const double px = axis == 0 ? p.x : p.y;
+                (target == 0.0 ? px > 0.0 : px < target) ? lo = m : hi = m;
+            }
+            return sign * lo;
+        };
+        return std::array<double, 4>{edge(0, 0.0), edge(0, w - 1.0), edge(1, 0.0), edge(1, h - 1.0)};
+    };
+    const auto eL = extents(rectifyKLeft, rectifyDLeft, R1);
+    const auto eR = extents(rectifyKRight, rectifyDRight, R2);
+    double xmin = std::max(eL[0], eR[0]), xmax = std::min(eL[1], eR[1]);
+    double ymin = std::max(eL[2], eR[2]), ymax = std::min(eL[3], eR[3]);
+
+    const double xc = (xmin + xmax) / 2, yc = (ymin + ymax) / 2;
+    const double xr = (xmax - xmin) / 2, yr = (ymax - ymin) / 2;
+    constexpr int kBorderSamples = 64;
+    auto borderInside = [&](double s) {
+        for(const auto& [K, D, R] : {std::tuple(rectifyKLeft, rectifyDLeft, R1), std::tuple(rectifyKRight, rectifyDRight, R2)}) {
+            for(int i = 0; i <= kBorderSamples; i++) {
+                const double t = -1.0 + 2.0 * i / kBorderSamples;
+                for(const auto& [x, y] : {std::pair(t, -1.0), std::pair(t, 1.0), std::pair(-1.0, t), std::pair(1.0, t)}) {
+                    const auto p = pixel(K, D, R, xc + s * xr * x, yc + s * yr * y);
+                    if(!(p.x >= 0.0 && p.x <= w - 1.0 && p.y >= 0.0 && p.y <= h - 1.0)) return false;
+                }
+            }
+        }
+        return true;
+    };
+    double lo = 0.0, hi = 1.0;
+    if(borderInside(hi)) {
+        lo = hi;
+    } else {
+        for(int i = 0; i < 40; i++) {
+            const double m = (lo + hi) / 2;
+            (borderInside(m) ? lo : hi) = m;
+        }
+    }
+    // A hair inside the last passing scale: the bisection converges from below,
+    // and the map is sampled at every pixel, not only at the border points.
+    const double s = lo * (1.0 - 1e-3);
+    xmin = xc - s * xr;
+    xmax = xc + s * xr;
+    ymin = yc - s * yr;
+    ymax = yc + s * yr;
+    const double fx = w / (xmax - xmin);
+    const double fy = h / (ymax - ymin);
+    return {fx, fy, -xmin * fx, -ymin * fy};
+}
+
+// Hand the recipe to the device as a warp mesh: a sparse grid of the raw (y, x)
+// each output pixel samples, which the firmware interpolates between. A loaded
+// mesh overrides the device's own rectification entirely (StereoDepth docs), so
+// the rectified pair -- and the depth computed from it -- comes out in OUR
+// projection, at no host cost. The device's own mesh is built from the left
+// camera's K and only the first 8 distortion coefficients; this one keeps the
+// whole lens and the full stored model.
+void Stereo::uploadRectifyMesh() {
+    const auto size = rectSize();
+    const int w = size.first, h = size.second;
+    auto mesh = [&](const cv::Mat& K, const cv::Mat& D, const std::array<double, 9>& Rarr, const std::array<double, 12>& Parr) {
+        cv::Mat R(3, 3, CV_64F), P(3, 4, CV_64F);
+        for(int i = 0; i < 3; i++) {
+            for(int j = 0; j < 3; j++) R.at<double>(i, j) = Rarr[i * 3 + j];
+            for(int j = 0; j < 4; j++) P.at<double>(i, j) = Parr[i * 4 + j];
+        }
+        cv::Mat mapX, mapY;
+        cv::initUndistortRectifyMap(K, D, R, P, cv::Size(w, h), CV_32FC1, mapX, mapY);
+        // Documented format: (h / step + 1) x (w / step + 1) points, each a
+        // (y, x) float pair, row-major.
+        std::vector<std::uint8_t> out;
+        out.reserve(static_cast<size_t>(h / kMeshStep + 1) * (w / kMeshStep + 1) * 2 * sizeof(float));
+        auto push = [&out](float v) {
+            const auto* p = reinterpret_cast<const std::uint8_t*>(&v);
+            out.insert(out.end(), p, p + sizeof(float));
+        };
+        for(int my = 0; my <= h / kMeshStep; my++) {
+            const int y = std::min(my * kMeshStep, h - 1);
+            for(int mx = 0; mx <= w / kMeshStep; mx++) {
+                const int x = std::min(mx * kMeshStep, w - 1);
+                push(mapY.at<float>(y, x));
+                push(mapX.at<float>(y, x));
+            }
+        }
+        return out;
+    };
+    stereoCamNode->setMeshStep(kMeshStep, kMeshStep);
+    stereoCamNode->loadMeshData(mesh(rectifyKLeft, rectifyDLeft, rectifyRLeft, rectifyPLeft), mesh(rectifyKRight, rectifyDRight, rectifyRRight, rectifyPRight));
+}
+
+// Only the classic StereoDepth node takes a warp mesh. On the neural-depth path
+// the device rectifies by its own recipe and the recipe above stays the left-K
+// one, so the published info keeps matching the pixels.
+bool Stereo::meshRectification() const {
+    return stereoCamNode != nullptr;
+}
+
+// The size of the outputs linked into the depth node -- what the rectified
+// frames, and therefore the maps and the mesh, are on.
+std::pair<int, int> Stereo::rectSize() const {
+    using ParamNames = param_handlers::ParamNames;
+    if(meshRectification()) {
+        return {ph->getParam<int>(ParamNames::WIDTH), ph->getParam<int>(ParamNames::HEIGHT)};
+    }
+    const auto name = getSocketName(leftSensInfo.socket);
+    return {ph->getOtherNodeParam<int>(name, "i_width"), ph->getOtherNodeParam<int>(name, "i_height")};
 }
 
 void Stereo::setupRectQueue(std::shared_ptr<dai::Device> device,
@@ -385,10 +576,10 @@ void Stereo::setupRectQueue(std::shared_ptr<dai::Device> device,
     pubConfig.infoMgrSuffix = "rect";
     pubConfig.publishCompressed = ph->getParam<bool>(isLeft ? "i_left_rect_publish_compressed" : "i_right_rect_publish_compressed");
 
-    // The firmware rectifies BOTH streams into the LEFT camera's intrinsics
-    // (see computeRectifyRecipe) — publish the mesh camera instead of an info
-    // derived from the EEPROM-stored rotations (validated by raw->rect feature
-    // reprojection at <1 px).
+    // Publish the recipe computeRectifyRecipe derived — the projection the
+    // uploaded mesh puts the pixels in — rather than an info built from the
+    // EEPROM-stored rotations (validated by raw->rect feature reprojection at
+    // <1 px).
     {
         const auto& Rrect = isLeft ? rectifyRLeft : rectifyRRight;
         const auto& P = isLeft ? rectifyPLeft : rectifyPRight;
@@ -412,10 +603,9 @@ void Stereo::setupRectQueue(std::shared_ptr<dai::Device> device,
     pub->setup(device, convConfig, pubConfig);
 }
 
-// One rectified frame per eye, shared by the device rect and the host wide rect:
-// both are built with the same R1/R2 and differ only in projection, so the
-// <side>_rect optical frame is anchored to the sensor frame once here, whichever
-// of the two streams is on. camera_info.r maps sensor-frame points into the
+// The rectified frame per eye, rotated from the sensor by R1/R2 and anchored
+// once here so either eye's stream is placed whether or not the other is on.
+// camera_info.r maps sensor-frame points into the
 // rectified frame (x_rect = R * x_cam), so the child's orientation is R^T.
 void Stereo::publishRectFrames() {
     if(!rectTfBroadcaster) {
@@ -441,140 +631,6 @@ void Stereo::publishRectFrames() {
     rectTfBroadcaster->sendTransform(tfs);
 }
 
-void Stereo::setupWideRectQueues() {
-    const int w = ph->getOtherNodeParam<int>(getSocketName(leftSensInfo.socket), "i_width");
-    const int h = ph->getOtherNodeParam<int>(getSocketName(leftSensInfo.socket), "i_height");
-    cv::Mat R1(3, 3, CV_64F), R2(3, 3, CV_64F);
-    for(int i = 0; i < 9; i++) {
-        R1.at<double>(i / 3, i % 3) = rectifyRLeft[i];
-        R2.at<double>(i / 3, i % 3) = rectifyRRight[i];
-    }
-    // Where the raw content ends in the rectified frame, along the rectified
-    // principal row/column (normalized coordinates). For a barrel lens the
-    // outline bulges outward at the corners, so these four points bound the
-    // largest rectangle fully inside the content. Found by bisection on the
-    // forward model, exact for any distortion strength.
-    auto extents = [&](const cv::Mat& K, const cv::Mat& D, const cv::Mat& R) {
-        auto pixel = [&](double x, double y, int axis) {
-            cv::Mat ray = R.t() * (cv::Mat_<double>(3, 1) << x, y, 1.0);
-            std::vector<cv::Point3d> obj{cv::Point3d(ray.at<double>(0), ray.at<double>(1), ray.at<double>(2))};
-            std::vector<cv::Point2d> img;
-            cv::projectPoints(obj, cv::Vec3d(0, 0, 0), cv::Vec3d(0, 0, 0), K, D, img);
-            return axis == 0 ? img[0].x : img[0].y;
-        };
-        auto edge = [&](int axis, double target) {
-            const double sign = target == 0.0 ? -1.0 : 1.0;
-            double lo = 0.0, hi = 8.0;
-            for(int i = 0; i < 200; i++) {
-                const double m = (lo + hi) / 2;
-                const double px = axis == 0 ? pixel(sign * m, 0.0, 0) : pixel(0.0, sign * m, 1);
-                const bool inside = target == 0.0 ? px > 0.0 : px < target;
-                (inside ? lo : hi) = m;
-            }
-            return sign * lo;
-        };
-        return std::array<double, 4>{edge(0, 0.0), edge(0, w - 1.0), edge(1, 0.0), edge(1, h - 1.0)};
-    };
-    // The lens model the host maps undistort with. The EEPROM written by the
-    // rena-commission calibration carries the 14-coefficient rational+tilt
-    // model, and truncating it is not the same lens: on a 129 deg OAK-W the
-    // dropped tilt terms are 1-2 px at the periphery this stream exists to
-    // keep. The device mesh consumes all 14 as well (measured against live
-    // firmware output: rena-tools/vo_ab/firmware_rect_model.py), so the full
-    // model is also what makes this stream agree with <side>_rect where they
-    // overlap. Default: the full stored model; 8 is kept for that A/B.
-    const int coefficients = ph->getParam<int>("i_host_wide_rect_distortion_coefficients");
-    auto model = [&](const cv::Mat& raw) {
-        const int n = std::min(coefficients, raw.cols);
-        cv::Mat D = cv::Mat::zeros(1, std::max(n, 4), CV_64F);
-        raw.colRange(0, n).copyTo(D.colRange(0, n));
-        return D;
-    };
-    const cv::Mat DL = model(rawDLeft), DR = model(rawDRight);
-    const auto eL = extents(rectifyKLeft, DL, R1);
-    const auto eR = extents(rectifyKRight, DR, R2);
-    const double xmin = std::max(eL[0], eR[0]), xmax = std::min(eL[1], eR[1]);
-    const double ymin = std::max(eL[2], eR[2]), ymax = std::min(eL[3], eR[3]);
-    const double margin = 0.01;
-    const double fx = w / (xmax - xmin) * (1.0 - margin);
-    const double fy = h / (ymax - ymin) * (1.0 - margin);
-    const double cx = -xmin * fx + (w - fx * (xmax - xmin)) / 2.0;
-    const double cy = -ymin * fy + (h - fy * (ymax - ymin)) / 2.0;
-    const double baseline = -rectifyPRight[3] / rectifyPLeft[0];  // signed, from the recipe
-    const double hfov = (std::atan((w - cx) / fx) + std::atan(cx / fx)) * 180.0 / M_PI;
-    const double hfovMesh = (std::atan((w - rectifyPLeft[2]) / rectifyPLeft[0]) + std::atan(rectifyPLeft[2] / rectifyPLeft[0])) * 180.0 / M_PI;
-    RCLCPP_INFO(getLogger(),
-                "wide rect: %dx%d, HFOV %.0f deg (firmware rect %.0f deg), fx=%.1f fy=%.1f cx=%.1f cy=%.1f, %d distortion coefficients",
-                w, h, hfov, hfovMesh, fx, fy, cx, cy, DL.cols);
-
-    auto setupSide = [&](WideRect& wr, dai::Node::Output* out, const dai::CameraFeatures& sensorInfo, const cv::Mat& K, const cv::Mat& D,
-                         const cv::Mat& R, bool isLeft) {
-        const auto sensorName = getSocketName(sensorInfo.socket);
-        cv::Mat P = (cv::Mat_<double>(3, 4) << fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0);
-        if(!isLeft) P.at<double>(0, 3) = -fx * baseline;
-        cv::initUndistortRectifyMap(K, D, R, P, cv::Size(w, h), CV_16SC2, wr.map1, wr.map2);
-
-        wr.info = sensor_msgs::msg::CameraInfo();
-        wr.info.width = w;
-        wr.info.height = h;
-        wr.info.distortion_model = "plumb_bob";
-        wr.info.d.assign(8, 0.0);
-        for(int i = 0; i < 3; i++) {
-            for(int j = 0; j < 3; j++) {
-                wr.info.k[i * 3 + j] = P.at<double>(i, j);
-                wr.info.r[i * 3 + j] = R.at<double>(i, j);
-            }
-            for(int j = 0; j < 4; j++) wr.info.p[i * 4 + j] = P.at<double>(i, j);
-        }
-        // Same rectified frame as the device rect (same R): publishRectFrames.
-        wr.conv = std::make_shared<depthai_bridge::ImageConverter>(getOpticalFrameName(sensorName + "_rect"), false, ph->getParam<bool>("i_get_base_device_timestamp"));
-        wr.conv->setUpdateRosBaseTimeOnToRosMsg(ph->getParam<bool>("i_update_ros_base_time_on_ros_msg"));
-        if(ph->getParam<bool>("i_reverse_stereo_socket_order")) {
-            wr.conv->reverseStereoSocketOrder();
-        }
-        wr.pub = image_transport::create_camera_publisher(getROSNode().get(), "~/" + sensorName + "_rect_wide/image_rect");
-        wr.q = out->createOutputQueue(ph->getParam<int>(param_handlers::ParamNames::MAX_Q_SIZE), false);
-        wr.cbId = wr.q->addCallback([this, isLeft](const std::shared_ptr<dai::ADatatype>& data) { publishWideRect(data, isLeft); });
-    };
-    setupSide(wideLeft, leftOut, leftSensInfo, rectifyKLeft, DL, R1, true);
-    setupSide(wideRight, rightOut, rightSensInfo, rectifyKRight, DR, R2, false);
-}
-
-void Stereo::publishWideRect(const std::shared_ptr<dai::ADatatype>& data, bool isLeft) {
-    auto& wr = isLeft ? wideLeft : wideRight;
-    if(wr.pub.getNumSubscribers() == 0) {
-        return;
-    }
-    auto frame = std::dynamic_pointer_cast<dai::ImgFrame>(data);
-    if(!frame) {
-        return;
-    }
-    // The converter owns timestamp/frame_id semantics (device->ROS time base,
-    // socket order); we only re-sample its pixels.
-    auto raw = wr.conv->toRosMsgRawPtr(frame);
-    cv_bridge::CvImagePtr gray;
-    try {
-        gray = cv_bridge::toCvCopy(raw, sensor_msgs::image_encodings::MONO8);
-    } catch(const std::exception& e) {
-        if(!wr.warned) {
-            RCLCPP_WARN(getLogger(), "wide rect: cannot convert %s frames to mono8: %s", raw.encoding.c_str(), e.what());
-            wr.warned = true;
-        }
-        return;
-    }
-    if(gray->image.cols != wr.map1.cols || gray->image.rows != wr.map1.rows) {
-        if(!wr.warned) {
-            RCLCPP_WARN(getLogger(), "wide rect: frame %dx%d does not match the %dx%d recipe; not publishing", gray->image.cols, gray->image.rows, wr.map1.cols, wr.map1.rows);
-            wr.warned = true;
-        }
-        return;
-    }
-    cv::Mat rect;
-    cv::remap(gray->image, rect, wr.map1, wr.map2, cv::INTER_LINEAR);
-    auto msg = cv_bridge::CvImage(raw.header, sensor_msgs::image_encodings::MONO8, rect).toImageMsg();
-    wr.info.header = raw.header;
-    wr.pub.publish(*msg, wr.info);
-}
 
 void Stereo::setupLeftRectQueue(std::shared_ptr<dai::Device> device) {
     setupRectQueue(device, leftSensInfo, leftRectPub, true);
@@ -622,6 +678,26 @@ void Stereo::setupStereoQueue(std::shared_ptr<dai::Device> device) {
     pubConf.logLatency = ph->getParam<bool>("i_log_latency");
     pubConf.pngLevel = ph->getParam<int>("i_depth_png_level");
     pubConf.enableCompressed = ph->getParam<bool>("i_enable_compressed");
+    // Unaligned depth lives in the rectified left frame, so its info is that
+    // camera -- which, with a mesh uploaded, is our projection and not the one
+    // the device calibration would give. Aligned depth is warped to another
+    // camera and keeps that camera's own info.
+    if(meshRectification() && !aligned) {
+        sensor_msgs::msg::CameraInfo info;
+        info.width = pubConf.width;
+        info.height = pubConf.height;
+        info.distortion_model = "plumb_bob";
+        info.d.assign(8, 0.0);
+        for(int i = 0; i < 3; i++) {
+            for(int j = 0; j < 3; j++) {
+                info.k[i * 3 + j] = rectifyPLeft[i * 4 + j];
+                info.r[i * 3 + j] = rectifyRLeft[i * 3 + j];
+            }
+        }
+        info.p = rectifyPLeft;
+        pubConf.overrideInfo = info;
+        pubConf.hasOverrideInfo = true;
+    }
 
     stereoPub->setup(device, convConfig, pubConf);
     if(ph->getParam<bool>("i_use_neural_depth")) {
@@ -658,7 +734,6 @@ void Stereo::setupConfidenceQueue(std::shared_ptr<dai::Device> device) {
 }
 
 void Stereo::setupQueues(std::shared_ptr<dai::Device> device) {
-    computeRectifyRecipe(device);
     // Raw K/D stay the sensor's own; R/P carry the rectification recipe.
     for(auto& pub : left->getPublishers()) {
         pub->setRectifyOverride(rectifyRLeft, rectifyPLeft);
@@ -680,20 +755,16 @@ void Stereo::setupQueues(std::shared_ptr<dai::Device> device) {
     if(ph->getParam<bool>("i_enable_right_rgbd")) {
         rgbdNodeRight->setupQueues(device);
     }
-    const bool leftDevice = ph->getParam<bool>("i_left_device_rect_publish_topic");
-    const bool rightDevice = ph->getParam<bool>("i_right_device_rect_publish_topic");
-    const bool hostWide = ph->getParam<bool>("i_host_wide_rect_publish_topic");
-    if(leftDevice || rightDevice || hostWide) {
+    const bool left_ = ph->getParam<bool>("i_left_rect_publish_topic");
+    const bool right_ = ph->getParam<bool>("i_right_rect_publish_topic");
+    if(left_ || right_) {
         publishRectFrames();
     }
-    if(leftDevice) {
+    if(left_) {
         setupLeftRectQueue(device);
     }
-    if(rightDevice) {
+    if(right_) {
         setupRightRectQueue(device);
-    }
-    if(hostWide) {
-        setupWideRectQueues();
     }
     if(ph->getParam<bool>("i_left_rect_enable_feature_tracker")) {
         featureTrackerLeftR->setupQueues(device);
@@ -723,17 +794,11 @@ void Stereo::closeQueues() {
     if(ph->getParam<bool>("i_enable_right_rgbd")) {
         rgbdNodeRight->closeQueues();
     }
-    if(ph->getParam<bool>("i_left_device_rect_publish_topic")) {
+    if(ph->getParam<bool>("i_left_rect_publish_topic")) {
         leftRectPub->closeQueue();
     }
-    if(ph->getParam<bool>("i_right_device_rect_publish_topic")) {
+    if(ph->getParam<bool>("i_right_rect_publish_topic")) {
         rightRectPub->closeQueue();
-    }
-    for(auto* wr : {&wideLeft, &wideRight}) {
-        if(wr->q && !wr->q->isClosed()) {
-            wr->q->removeCallback(wr->cbId);
-            wr->q->close();
-        }
     }
     if(ph->getParam<bool>("i_left_rect_enable_feature_tracker")) {
         featureTrackerLeftR->closeQueues();
@@ -782,10 +847,10 @@ std::vector<std::shared_ptr<sensor_helpers::ImagePublisher>> Stereo::getPublishe
     if(ph->getParam<bool>("i_publish_topic") && ph->getParam<bool>("i_synced")) {
         pubs.push_back(stereoPub);
     }
-    if(ph->getParam<bool>("i_left_device_rect_publish_topic") && ph->getParam<bool>("i_left_rect_synced")) {
+    if(ph->getParam<bool>("i_left_rect_publish_topic") && ph->getParam<bool>("i_left_rect_synced")) {
         pubs.push_back(leftRectPub);
     }
-    if(ph->getParam<bool>("i_right_device_rect_publish_topic") && ph->getParam<bool>("i_right_rect_synced")) {
+    if(ph->getParam<bool>("i_right_rect_publish_topic") && ph->getParam<bool>("i_right_rect_synced")) {
         pubs.push_back(rightRectPub);
     }
     auto pubsLeft = left->getPublishers();
