@@ -532,7 +532,7 @@ bool Stereo::meshRectification() const {
 
 // The size of the outputs linked into the depth node -- what the rectified
 // frames, and therefore the maps and the mesh, are on.
-std::pair<int, int> Stereo::rectSize() const {
+std::pair<int, int> Stereo::rectSize() {
     using ParamNames = param_handlers::ParamNames;
     if(meshRectification()) {
         return {ph->getParam<int>(ParamNames::WIDTH), ph->getParam<int>(ParamNames::HEIGHT)};

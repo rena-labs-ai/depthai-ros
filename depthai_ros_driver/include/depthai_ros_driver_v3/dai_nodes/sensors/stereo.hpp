@@ -95,7 +95,7 @@ class Stereo : public BaseNode {
     void computeRectifyRecipe(std::shared_ptr<dai::Device> device);
     void uploadRectifyMesh();
     bool meshRectification() const;
-    std::pair<int, int> rectSize() const;
+    std::pair<int, int> rectSize();
     cv::Mat lensModel(const std::vector<float>& raw) const;
     std::tuple<double, double, double, double> wideProjection(const cv::Mat& R1, const cv::Mat& R2, int w, int h) const;
     void publishRectFrames();
