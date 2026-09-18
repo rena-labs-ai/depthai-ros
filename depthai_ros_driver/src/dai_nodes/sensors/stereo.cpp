@@ -500,8 +500,11 @@ void Stereo::uploadRectifyMesh() {
             for(int j = 0; j < 3; j++) R.at<double>(i, j) = Rarr[i * 3 + j];
             for(int j = 0; j < 4; j++) P.at<double>(i, j) = Parr[i * 4 + j];
         }
+        // The last mesh point sits AT w/h, one past the image, so the map is built a step
+        // larger and read there: clamping it to w-1 would leave the final interpolated band
+        // following the wrong sample.
         cv::Mat mapX, mapY;
-        cv::initUndistortRectifyMap(K, D, R, P, cv::Size(w, h), CV_32FC1, mapX, mapY);
+        cv::initUndistortRectifyMap(K, D, R, P, cv::Size(w + kMeshStep, h + kMeshStep), CV_32FC1, mapX, mapY);
         // Documented format: (h / step + 1) x (w / step + 1) points, each a
         // (y, x) float pair, row-major.
         std::vector<std::uint8_t> out;
@@ -511,11 +514,9 @@ void Stereo::uploadRectifyMesh() {
             out.insert(out.end(), p, p + sizeof(float));
         };
         for(int my = 0; my <= h / kMeshStep; my++) {
-            const int y = std::min(my * kMeshStep, h - 1);
             for(int mx = 0; mx <= w / kMeshStep; mx++) {
-                const int x = std::min(mx * kMeshStep, w - 1);
-                push(mapY.at<float>(y, x));
-                push(mapX.at<float>(y, x));
+                push(mapY.at<float>(my * kMeshStep, mx * kMeshStep));
+                push(mapX.at<float>(my * kMeshStep, mx * kMeshStep));
             }
         }
         return out;
