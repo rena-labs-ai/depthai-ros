@@ -4,13 +4,13 @@ namespace tf2_ros {
 class StaticTransformBroadcaster;
 }  // namespace tf2_ros
 
-#include "depthai_bridge/ImageConverter.hpp"
-#include "image_transport/image_transport.hpp"
 #include "opencv2/core.hpp"
 #include "sensor_msgs/msg/camera_info.hpp"
 #include <array>
 #include <memory>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "depthai/common/CameraBoardSocket.hpp"
@@ -93,30 +93,29 @@ class Stereo : public BaseNode {
     void setupRightRectQueue(std::shared_ptr<dai::Device> device);
     void setupRectQueue(std::shared_ptr<dai::Device> device, dai::CameraFeatures& sensorInfo, std::shared_ptr<sensor_helpers::ImagePublisher> pub, bool isLeft);
     void computeRectifyRecipe(std::shared_ptr<dai::Device> device);
+    void uploadRectifyMesh();
+    bool meshRectification() const;
+    std::pair<int, int> rectSize();
+    cv::Mat lensModel(const std::vector<float>& raw) const;
+    std::tuple<double, double, double, double> wideProjection(const cv::Mat& R1, const cv::Mat& R2, int w, int h) const;
     void publishRectFrames();
     std::array<double, 9> rectifyRLeft{}, rectifyRRight{};
     std::array<double, 12> rectifyPLeft{}, rectifyPRight{};
-    // Raw intrinsics (at i_width x i_height) and the stored distortion model
-    // (all coefficients, 14 for the rational+tilt model) the host wide rect
-    // undistorts with; the firmware recipe above truncates it to 8.
-    cv::Mat rectifyKLeft, rectifyKRight, rawDLeft, rawDRight;
-    // Host-side "wide" rectification: same R1/R2 as the device (firmware) rect,
-    // but the projection is the largest sensor-size rectangle fully inside the
-    // raw content (anisotropic focal), so the whole lens FOV survives with no
-    // black borders. Published as <side>_rect_wide, independently of the device
-    // rect's <side>_rect; either or both may be on.
-    struct WideRect {
-        std::shared_ptr<dai::MessageQueue> q;
-        int cbId = -1;
-        cv::Mat map1, map2;
-        sensor_msgs::msg::CameraInfo info;
-        std::shared_ptr<depthai_bridge::ImageConverter> conv;
-        image_transport::CameraPublisher pub;
-        bool warned = false;
-    };
-    WideRect wideLeft, wideRight;
-    void setupWideRectQueues();
-    void publishWideRect(const std::shared_ptr<dai::ADatatype>& data, bool isLeft);
+    // Raw intrinsics (at the rectified size) and the stored distortion model,
+    // padded to a length OpenCV accepts -- all of it, 14 coefficients for the
+    // rational+tilt model this calibration writes.
+    cv::Mat rectifyKLeft, rectifyKRight, rectifyDLeft, rectifyDRight;
+    // Distance between mesh points, in both directions: the device interpolates
+    // between them, so this sets how faithfully it can follow the map's
+    // curvature. Measured on rena_08's stored calibration, bilinearly
+    // interpolating the grid back to every pixel: 0.28 px worst at the device's
+    // default of 16, 0.11 px at 10, against the 1.25 px the rectified path is
+    // judged on. 16 would do; 10 buys the margin for 21 KB per eye, uploaded
+    // once at startup. Below 9 the firmware refuses the mesh outright ("Mesh
+    // step width must be 9 or greater!") and then drops the stream, and 10 is
+    // the smallest allowed step dividing 640x400 evenly, so the last grid point
+    // lands on the frame edge rather than short of it.
+    static constexpr int kMeshStep = 10;
     std::shared_ptr<sensor_helpers::ImagePublisher> stereoPub, leftRectPub, rightRectPub, confidencePub;
     std::shared_ptr<tf2_ros::StaticTransformBroadcaster> rectTfBroadcaster;
     StereoNodeWrapper stereoNodeWrapper;
