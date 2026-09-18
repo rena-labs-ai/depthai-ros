@@ -377,7 +377,7 @@ void Stereo::computeRectifyRecipe(std::shared_ptr<dai::Device> device) {
     const double hfov = (std::atan((w - cx) / fx) + std::atan(cx / fx)) * 180.0 / M_PI;
     const double hfovK = (std::atan((w - K1.at<double>(0, 2)) / K1.at<double>(0, 0)) + std::atan(K1.at<double>(0, 2) / K1.at<double>(0, 0))) * 180.0 / M_PI;
     RCLCPP_INFO(getLogger(),
-                "rect: %dx%d, HFOV %.0f deg (%s; the device's own left-K recipe would be %.0f deg), fx=%.1f fy=%.1f cx=%.1f cy=%.1f, %d distortion coefficients",
+                "rect: %dx%d, HFOV %.0f deg (%s; the device's own left-K recipe would be %.0f deg), fx=%.1f fy=%.1f cx=%.1f cy=%.1f, %d distortion coefficients, mesh step %d",
                 w,
                 h,
                 hfov,
@@ -387,7 +387,8 @@ void Stereo::computeRectifyRecipe(std::shared_ptr<dai::Device> device) {
                 fy,
                 cx,
                 cy,
-                rectifyDLeft.cols);
+                rectifyDLeft.cols,
+                meshRectification() ? kMeshStep : 0);
 }
 
 // OpenCV takes 4, 5, 8, 12 or 14 distortion coefficients. The EEPROM this

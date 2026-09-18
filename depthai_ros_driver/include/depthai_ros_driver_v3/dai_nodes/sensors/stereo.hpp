@@ -105,9 +105,15 @@ class Stereo : public BaseNode {
     // padded to a length OpenCV accepts -- all of it, 14 coefficients for the
     // rational+tilt model this calibration writes.
     cv::Mat rectifyKLeft, rectifyKRight, rectifyDLeft, rectifyDRight;
-    // Distance between mesh points, in both directions. The device interpolates
-    // between them; 16 is its own default and is fine for a smooth lens map.
-    static constexpr int kMeshStep = 16;
+    // Distance between mesh points, in both directions: the device interpolates
+    // between them, so this sets how faithfully it can follow the map's
+    // curvature. The device's own default of 16 is not enough for a 129 deg
+    // lens -- measured on rena_08 against a host remap of the same raw frame, a
+    // step-16 mesh agreed to 0.00 px at the centre but was 1.57 px out at the
+    // periphery, over the 1.25 px the rectified path is judged on. The error
+    // goes as the square of the step, so 4 leaves ~0.1 px, for 130 KB per eye
+    // uploaded once at startup.
+    static constexpr int kMeshStep = 4;
     std::shared_ptr<sensor_helpers::ImagePublisher> stereoPub, leftRectPub, rightRectPub, confidencePub;
     std::shared_ptr<tf2_ros::StaticTransformBroadcaster> rectTfBroadcaster;
     StereoNodeWrapper stereoNodeWrapper;
