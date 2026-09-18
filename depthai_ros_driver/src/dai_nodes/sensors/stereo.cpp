@@ -472,6 +472,11 @@ std::tuple<double, double, double, double> Stereo::wideProjection(const cv::Mat&
             (borderInside(m) ? lo : hi) = m;
         }
     }
+    if(lo <= 0.0) {
+        // Nothing the two eyes can both see: the box would be empty and the focal infinite.
+        // Better to refuse than to upload a mesh built from it.
+        throw std::runtime_error("stereo: the rectified views share no region inside both raw images; calibration is unusable");
+    }
     // A hair inside the last passing scale: the bisection converges from below,
     // and the map is sampled at every pixel, not only at the border points.
     const double s = lo * (1.0 - 1e-3);
@@ -494,6 +499,12 @@ std::tuple<double, double, double, double> Stereo::wideProjection(const cv::Mat&
 void Stereo::uploadRectifyMesh() {
     const auto size = rectSize();
     const int w = size.first, h = size.second;
+    if(w % kMeshStep != 0 || h % kMeshStep != 0) {
+        // The device reads w/step+1 by h/step+1 points spaced step apart, so a remainder leaves
+        // the last strip of the image off the grid and warped by extrapolation.
+        throw std::runtime_error("stereo: mesh step " + std::to_string(kMeshStep) + " does not divide " + std::to_string(w) + "x"
+                                 + std::to_string(h));
+    }
     auto mesh = [&](const cv::Mat& K, const cv::Mat& D, const std::array<double, 9>& Rarr, const std::array<double, 12>& Parr) {
         cv::Mat R(3, 3, CV_64F), P(3, 4, CV_64F);
         for(int i = 0; i < 3; i++) {
