@@ -107,14 +107,14 @@ class Stereo : public BaseNode {
     cv::Mat rectifyKLeft, rectifyKRight, rectifyDLeft, rectifyDRight;
     // Distance between mesh points, in both directions: the device interpolates
     // between them, so this sets how faithfully it can follow the map's
-    // curvature. The device's own default of 16 is not enough for a 129 deg
-    // lens -- measured on rena_08 against a host remap of the same raw frame, a
-    // step-16 mesh agreed to 0.00 px at the centre but was 1.57 px out at the
-    // periphery, over the 1.25 px the rectified path is judged on. The error
-    // goes as the square of the step. The firmware rejects anything under 9
-    // ("Mesh step width must be 9 or greater!", and the stream then dies), and
-    // 10 is the smallest step at or above that which divides 640x400 evenly, so
-    // the last grid point lands on the frame edge rather than short of it.
+    // curvature. Measured on rena_08's stored calibration, bilinearly
+    // interpolating the grid back to every pixel: 0.28 px worst at the device's
+    // default of 16, 0.11 px at 10, against the 1.25 px the rectified path is
+    // judged on. 16 would do; 10 buys the margin for 21 KB per eye, uploaded
+    // once at startup. Below 9 the firmware refuses the mesh outright ("Mesh
+    // step width must be 9 or greater!") and then drops the stream, and 10 is
+    // the smallest allowed step dividing 640x400 evenly, so the last grid point
+    // lands on the frame edge rather than short of it.
     static constexpr int kMeshStep = 10;
     std::shared_ptr<sensor_helpers::ImagePublisher> stereoPub, leftRectPub, rightRectPub, confidencePub;
     std::shared_ptr<tf2_ros::StaticTransformBroadcaster> rectTfBroadcaster;
