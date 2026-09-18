@@ -111,9 +111,11 @@ class Stereo : public BaseNode {
     // lens -- measured on rena_08 against a host remap of the same raw frame, a
     // step-16 mesh agreed to 0.00 px at the centre but was 1.57 px out at the
     // periphery, over the 1.25 px the rectified path is judged on. The error
-    // goes as the square of the step, so 4 leaves ~0.1 px, for 130 KB per eye
-    // uploaded once at startup.
-    static constexpr int kMeshStep = 4;
+    // goes as the square of the step. The firmware rejects anything under 9
+    // ("Mesh step width must be 9 or greater!", and the stream then dies), and
+    // 10 is the smallest step at or above that which divides 640x400 evenly, so
+    // the last grid point lands on the frame edge rather than short of it.
+    static constexpr int kMeshStep = 10;
     std::shared_ptr<sensor_helpers::ImagePublisher> stereoPub, leftRectPub, rightRectPub, confidencePub;
     std::shared_ptr<tf2_ros::StaticTransformBroadcaster> rectTfBroadcaster;
     StereoNodeWrapper stereoNodeWrapper;
